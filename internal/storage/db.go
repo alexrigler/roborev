@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS review_jobs (
   started_at TEXT,
   finished_at TEXT,
   worker_id TEXT,
-  error TEXT
+  error TEXT,
+  prompt TEXT
 );
 
 CREATE TABLE IF NOT EXISTS reviews (
@@ -96,7 +97,31 @@ func Open(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("initialize schema: %w", err)
 	}
 
+	// Run migrations for existing databases
+	if err := wrapped.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
+
 	return wrapped, nil
+}
+
+// migrate runs any needed migrations for existing databases
+func (db *DB) migrate() error {
+	// Migration: add prompt column to review_jobs if missing
+	// Check if column exists by querying pragma
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'prompt'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check prompt column: %w", err)
+	}
+	if count == 0 {
+		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN prompt TEXT`)
+		if err != nil {
+			return fmt.Errorf("add prompt column: %w", err)
+		}
+	}
+	return nil
 }
 
 // ResetStaleJobs marks all running jobs as queued (for daemon restart)

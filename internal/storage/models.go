@@ -40,6 +40,7 @@ type ReviewJob struct {
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	WorkerID   string     `json:"worker_id,omitempty"`
 	Error      string     `json:"error,omitempty"`
+	Prompt     string     `json:"prompt,omitempty"`
 
 	// Joined fields for convenience
 	RepoPath      string `json:"repo_path,omitempty"`

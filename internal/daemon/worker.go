@@ -109,6 +109,11 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		return
 	}
 
+	// Save the prompt so it can be viewed while job is running
+	if err := wp.db.SaveJobPrompt(job.ID, reviewPrompt); err != nil {
+		log.Printf("[%s] Error saving prompt: %v", workerID, err)
+	}
+
 	// Get the agent (falls back to available agent if preferred not installed)
 	a, err := agent.GetAvailable(job.Agent)
 	if err != nil {

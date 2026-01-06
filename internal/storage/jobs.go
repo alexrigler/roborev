@@ -108,6 +108,12 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 	return &job, nil
 }
 
+// SaveJobPrompt stores the prompt for a running job
+func (db *DB) SaveJobPrompt(jobID int64, prompt string) error {
+	_, err := db.Exec(`UPDATE review_jobs SET prompt = ? WHERE id = ?`, prompt, jobID)
+	return err
+}
+
 // CompleteJob marks a job as done and stores the review
 func (db *DB) CompleteJob(jobID int64, agent, prompt, output string) error {
 	tx, err := db.Begin()
@@ -146,7 +152,7 @@ func (db *DB) FailJob(jobID int64, errorMsg string) error {
 func (db *DB) ListJobs(statusFilter string, limit int) ([]ReviewJob, error) {
 	query := `
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.agent, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error,
+		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt,
 		       r.root_path, r.name, c.subject
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
@@ -176,12 +182,12 @@ func (db *DB) ListJobs(statusFilter string, limit int) ([]ReviewJob, error) {
 	for rows.Next() {
 		var j ReviewJob
 		var enqueuedAt string
-		var startedAt, finishedAt, workerID, errMsg sql.NullString
+		var startedAt, finishedAt, workerID, errMsg, prompt sql.NullString
 		var commitID sql.NullInt64
 		var commitSubject sql.NullString
 
 		err := rows.Scan(&j.ID, &j.RepoID, &commitID, &j.GitRef, &j.Agent, &j.Status, &enqueuedAt,
-			&startedAt, &finishedAt, &workerID, &errMsg,
+			&startedAt, &finishedAt, &workerID, &errMsg, &prompt,
 			&j.RepoPath, &j.RepoName, &commitSubject)
 		if err != nil {
 			return nil, err
@@ -208,6 +214,9 @@ func (db *DB) ListJobs(statusFilter string, limit int) ([]ReviewJob, error) {
 		if errMsg.Valid {
 			j.Error = errMsg.String
 		}
+		if prompt.Valid {
+			j.Prompt = prompt.String
+		}
 
 		jobs = append(jobs, j)
 	}
@@ -219,20 +228,20 @@ func (db *DB) ListJobs(statusFilter string, limit int) ([]ReviewJob, error) {
 func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	var j ReviewJob
 	var enqueuedAt string
-	var startedAt, finishedAt, workerID, errMsg sql.NullString
+	var startedAt, finishedAt, workerID, errMsg, prompt sql.NullString
 	var commitID sql.NullInt64
 	var commitSubject sql.NullString
 
 	err := db.QueryRow(`
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.agent, j.status, j.enqueued_at,
-		       j.started_at, j.finished_at, j.worker_id, j.error,
+		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt,
 		       r.root_path, r.name, c.subject
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
 		WHERE j.id = ?
 	`, id).Scan(&j.ID, &j.RepoID, &commitID, &j.GitRef, &j.Agent, &j.Status, &enqueuedAt,
-		&startedAt, &finishedAt, &workerID, &errMsg,
+		&startedAt, &finishedAt, &workerID, &errMsg, &prompt,
 		&j.RepoPath, &j.RepoName, &commitSubject)
 	if err != nil {
 		return nil, err
@@ -258,6 +267,9 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	}
 	if errMsg.Valid {
 		j.Error = errMsg.String
+	}
+	if prompt.Valid {
+		j.Prompt = prompt.String
 	}
 
 	return &j, nil
