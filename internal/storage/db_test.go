@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -211,6 +213,67 @@ func TestResponseOperations(t *testing.T) {
 
 	if len(responses) != 1 {
 		t.Errorf("Expected 1 response, got %d", len(responses))
+	}
+}
+
+func TestMarkReviewAddressed(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo, _ := db.GetOrCreateRepo("/tmp/test-repo")
+	commit, _ := db.GetOrCreateCommit(repo.ID, "addr123", "Author", "Subject", time.Now())
+	job, _ := db.EnqueueJob(repo.ID, commit.ID, "addr123", "codex")
+	db.ClaimJob("worker-1")
+	db.CompleteJob(job.ID, "codex", "prompt", "output")
+
+	// Get the review
+	review, err := db.GetReviewByJobID(job.ID)
+	if err != nil {
+		t.Fatalf("GetReviewByJobID failed: %v", err)
+	}
+
+	// Initially not addressed
+	if review.Addressed {
+		t.Error("Review should not be addressed initially")
+	}
+
+	// Mark as addressed
+	err = db.MarkReviewAddressed(review.ID, true)
+	if err != nil {
+		t.Fatalf("MarkReviewAddressed failed: %v", err)
+	}
+
+	// Verify it's addressed
+	updated, _ := db.GetReviewByID(review.ID)
+	if !updated.Addressed {
+		t.Error("Review should be addressed after MarkReviewAddressed(true)")
+	}
+
+	// Mark as unaddressed
+	err = db.MarkReviewAddressed(review.ID, false)
+	if err != nil {
+		t.Fatalf("MarkReviewAddressed(false) failed: %v", err)
+	}
+
+	updated2, _ := db.GetReviewByID(review.ID)
+	if updated2.Addressed {
+		t.Error("Review should not be addressed after MarkReviewAddressed(false)")
+	}
+}
+
+func TestMarkReviewAddressedNotFound(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Try to mark a non-existent review
+	err := db.MarkReviewAddressed(999999, true)
+	if err == nil {
+		t.Fatal("Expected error for non-existent review")
+	}
+
+	// Should be sql.ErrNoRows
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("Expected sql.ErrNoRows, got: %v", err)
 	}
 }
 
