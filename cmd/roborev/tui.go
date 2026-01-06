@@ -51,6 +51,7 @@ const (
 type tuiModel struct {
 	serverAddr      string
 	daemonVersion   string
+	client          *http.Client
 	jobs            []storage.ReviewJob
 	status          storage.DaemonStatus
 	selectedIdx     int
@@ -82,6 +83,7 @@ func newTuiModel(serverAddr string) tuiModel {
 	return tuiModel{
 		serverAddr:    serverAddr,
 		daemonVersion: daemonVersion,
+		client:        &http.Client{Timeout: 10 * time.Second},
 		jobs:          []storage.ReviewJob{},
 		currentView:   tuiViewQueue,
 		width:         80, // sensible defaults until we get WindowSizeMsg
@@ -106,11 +108,15 @@ func (m tuiModel) tick() tea.Cmd {
 
 func (m tuiModel) fetchJobs() tea.Cmd {
 	return func() tea.Msg {
-		resp, err := http.Get(m.serverAddr + "/api/jobs?limit=50")
+		resp, err := m.client.Get(m.serverAddr + "/api/jobs?limit=50")
 		if err != nil {
 			return tuiErrMsg(err)
 		}
 		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return tuiErrMsg(fmt.Errorf("fetch jobs: %s", resp.Status))
+		}
 
 		var result struct {
 			Jobs []storage.ReviewJob `json:"jobs"`
@@ -124,11 +130,15 @@ func (m tuiModel) fetchJobs() tea.Cmd {
 
 func (m tuiModel) fetchStatus() tea.Cmd {
 	return func() tea.Msg {
-		resp, err := http.Get(m.serverAddr + "/api/status")
+		resp, err := m.client.Get(m.serverAddr + "/api/status")
 		if err != nil {
 			return tuiErrMsg(err)
 		}
 		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return tuiErrMsg(fmt.Errorf("fetch status: %s", resp.Status))
+		}
 
 		var status storage.DaemonStatus
 		if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
@@ -140,7 +150,7 @@ func (m tuiModel) fetchStatus() tea.Cmd {
 
 func (m tuiModel) fetchReview(jobID int64) tea.Cmd {
 	return func() tea.Msg {
-		resp, err := http.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
+		resp, err := m.client.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
 		if err != nil {
 			return tuiErrMsg(err)
 		}
@@ -148,6 +158,9 @@ func (m tuiModel) fetchReview(jobID int64) tea.Cmd {
 
 		if resp.StatusCode == http.StatusNotFound {
 			return tuiErrMsg(fmt.Errorf("no review found"))
+		}
+		if resp.StatusCode != http.StatusOK {
+			return tuiErrMsg(fmt.Errorf("fetch review: %s", resp.Status))
 		}
 
 		var review storage.Review
@@ -160,7 +173,7 @@ func (m tuiModel) fetchReview(jobID int64) tea.Cmd {
 
 func (m tuiModel) fetchReviewForPrompt(jobID int64) tea.Cmd {
 	return func() tea.Msg {
-		resp, err := http.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
+		resp, err := m.client.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
 		if err != nil {
 			return tuiErrMsg(err)
 		}
@@ -168,6 +181,9 @@ func (m tuiModel) fetchReviewForPrompt(jobID int64) tea.Cmd {
 
 		if resp.StatusCode == http.StatusNotFound {
 			return tuiErrMsg(fmt.Errorf("no review found"))
+		}
+		if resp.StatusCode != http.StatusOK {
+			return tuiErrMsg(fmt.Errorf("fetch review: %s", resp.Status))
 		}
 
 		var review storage.Review
@@ -180,18 +196,24 @@ func (m tuiModel) fetchReviewForPrompt(jobID int64) tea.Cmd {
 
 func (m tuiModel) addressReview(reviewID int64, addressed bool) tea.Cmd {
 	return func() tea.Msg {
-		reqBody, _ := json.Marshal(map[string]interface{}{
+		reqBody, err := json.Marshal(map[string]interface{}{
 			"review_id": reviewID,
 			"addressed": addressed,
 		})
-		resp, err := http.Post(m.serverAddr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
+		if err != nil {
+			return tuiErrMsg(err)
+		}
+		resp, err := m.client.Post(m.serverAddr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
 		if err != nil {
 			return tuiErrMsg(err)
 		}
 		defer resp.Body.Close()
 
+		if resp.StatusCode == http.StatusNotFound {
+			return tuiErrMsg(fmt.Errorf("review not found"))
+		}
 		if resp.StatusCode != http.StatusOK {
-			return tuiErrMsg(fmt.Errorf("failed to mark review"))
+			return tuiErrMsg(fmt.Errorf("mark review: %s", resp.Status))
 		}
 		return tuiAddressedMsg(addressed)
 	}
@@ -200,7 +222,7 @@ func (m tuiModel) addressReview(reviewID int64, addressed bool) tea.Cmd {
 func (m tuiModel) toggleAddressedForJob(jobID int64, currentState *bool) tea.Cmd {
 	return func() tea.Msg {
 		// Fetch the review to get its ID
-		resp, err := http.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
+		resp, err := m.client.Get(fmt.Sprintf("%s/api/review?job_id=%d", m.serverAddr, jobID))
 		if err != nil {
 			return tuiErrMsg(err)
 		}
@@ -208,6 +230,9 @@ func (m tuiModel) toggleAddressedForJob(jobID int64, currentState *bool) tea.Cmd
 
 		if resp.StatusCode == http.StatusNotFound {
 			return tuiErrMsg(fmt.Errorf("no review for this job"))
+		}
+		if resp.StatusCode != http.StatusOK {
+			return tuiErrMsg(fmt.Errorf("fetch review: %s", resp.Status))
 		}
 
 		var review storage.Review
@@ -222,18 +247,24 @@ func (m tuiModel) toggleAddressedForJob(jobID int64, currentState *bool) tea.Cmd
 		}
 
 		// Now mark it
-		reqBody, _ := json.Marshal(map[string]interface{}{
+		reqBody, err := json.Marshal(map[string]interface{}{
 			"review_id": review.ID,
 			"addressed": newState,
 		})
-		resp2, err := http.Post(m.serverAddr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
+		if err != nil {
+			return tuiErrMsg(err)
+		}
+		resp2, err := m.client.Post(m.serverAddr+"/api/review/address", "application/json", bytes.NewReader(reqBody))
 		if err != nil {
 			return tuiErrMsg(err)
 		}
 		defer resp2.Body.Close()
 
+		if resp2.StatusCode == http.StatusNotFound {
+			return tuiErrMsg(fmt.Errorf("review not found"))
+		}
 		if resp2.StatusCode != http.StatusOK {
-			return tuiErrMsg(fmt.Errorf("failed to mark review"))
+			return tuiErrMsg(fmt.Errorf("mark review: %s", resp2.Status))
 		}
 		return tuiAddressedMsg(newState)
 	}
