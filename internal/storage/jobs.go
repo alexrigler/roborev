@@ -165,6 +165,39 @@ func (db *DB) FailJob(jobID int64, errorMsg string) error {
 	return err
 }
 
+// RetryJob resets a failed job to queued for retry, returns false if max retries reached
+func (db *DB) RetryJob(jobID int64, maxRetries int) (bool, error) {
+	// Get current retry count
+	var retryCount int
+	err := db.QueryRow(`SELECT retry_count FROM review_jobs WHERE id = ?`, jobID).Scan(&retryCount)
+	if err != nil {
+		return false, err
+	}
+
+	if retryCount >= maxRetries {
+		return false, nil
+	}
+
+	// Reset to queued and increment retry count
+	_, err = db.Exec(`
+		UPDATE review_jobs
+		SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = retry_count + 1
+		WHERE id = ?
+	`, jobID)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
+// GetJobRetryCount returns the retry count for a job
+func (db *DB) GetJobRetryCount(jobID int64) (int, error) {
+	var count int
+	err := db.QueryRow(`SELECT retry_count FROM review_jobs WHERE id = ?`, jobID).Scan(&count)
+	return count, err
+}
+
 // ListJobs returns jobs with optional status filter
 func (db *DB) ListJobs(statusFilter string, limit int) ([]ReviewJob, error) {
 	query := `

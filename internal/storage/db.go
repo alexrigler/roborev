@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS review_jobs (
   finished_at TEXT,
   worker_id TEXT,
   error TEXT,
-  prompt TEXT
+  prompt TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS reviews (
@@ -131,6 +132,18 @@ func (db *DB) migrate() error {
 		_, err = db.Exec(`ALTER TABLE reviews ADD COLUMN addressed INTEGER NOT NULL DEFAULT 0`)
 		if err != nil {
 			return fmt.Errorf("add addressed column: %w", err)
+		}
+	}
+
+	// Migration: add retry_count column to review_jobs if missing
+	err = db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('review_jobs') WHERE name = 'retry_count'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("check retry_count column: %w", err)
+	}
+	if count == 0 {
+		_, err = db.Exec(`ALTER TABLE review_jobs ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`)
+		if err != nil {
+			return fmt.Errorf("add retry_count column: %w", err)
 		}
 	}
 

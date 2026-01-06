@@ -95,6 +95,8 @@ func (wp *WorkerPool) worker(id int) {
 	}
 }
 
+const maxRetries = 3
+
 func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	log.Printf("[%s] Processing job %d for ref %s in %s", workerID, job.ID, job.GitRef, job.RepoName)
 
@@ -105,7 +107,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	reviewPrompt, err := wp.promptBuilder.Build(job.RepoPath, job.GitRef, job.RepoID, wp.cfg.ReviewContextCount)
 	if err != nil {
 		log.Printf("[%s] Error building prompt: %v", workerID, err)
-		wp.db.FailJob(job.ID, fmt.Sprintf("build prompt: %v", err))
+		wp.failOrRetry(workerID, job.ID, fmt.Sprintf("build prompt: %v", err))
 		return
 	}
 
@@ -118,7 +120,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	a, err := agent.GetAvailable(job.Agent)
 	if err != nil {
 		log.Printf("[%s] Error getting agent: %v", workerID, err)
-		wp.db.FailJob(job.ID, fmt.Sprintf("get agent: %v", err))
+		wp.failOrRetry(workerID, job.ID, fmt.Sprintf("get agent: %v", err))
 		return
 	}
 
@@ -133,7 +135,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	output, err := a.Review(ctx, job.RepoPath, job.GitRef, reviewPrompt)
 	if err != nil {
 		log.Printf("[%s] Agent error: %v", workerID, err)
-		wp.db.FailJob(job.ID, fmt.Sprintf("agent: %v", err))
+		wp.failOrRetry(workerID, job.ID, fmt.Sprintf("agent: %v", err))
 		return
 	}
 
@@ -144,4 +146,22 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	}
 
 	log.Printf("[%s] Completed job %d", workerID, job.ID)
+}
+
+// failOrRetry attempts to retry the job, or marks it as failed if max retries reached
+func (wp *WorkerPool) failOrRetry(workerID string, jobID int64, errorMsg string) {
+	retried, err := wp.db.RetryJob(jobID, maxRetries)
+	if err != nil {
+		log.Printf("[%s] Error retrying job: %v", workerID, err)
+		wp.db.FailJob(jobID, errorMsg)
+		return
+	}
+
+	if retried {
+		retryCount, _ := wp.db.GetJobRetryCount(jobID)
+		log.Printf("[%s] Job %d queued for retry (%d/%d)", workerID, jobID, retryCount, maxRetries)
+	} else {
+		log.Printf("[%s] Job %d failed after %d retries", workerID, jobID, maxRetries)
+		wp.db.FailJob(jobID, errorMsg)
+	}
 }
