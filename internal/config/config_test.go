@@ -80,3 +80,81 @@ func TestSaveAndLoadGlobal(t *testing.T) {
 		t.Errorf("Expected MaxWorkers 8, got %d", loaded.MaxWorkers)
 	}
 }
+
+func TestLoadRepoConfigWithGuidelines(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Test loading config with review guidelines
+	configContent := `
+agent = "claude-code"
+review_guidelines = [
+    "We are not doing database migrations because there are no production databases yet",
+    "Prefer composition over inheritance",
+    "All public APIs must have documentation comments"
+]
+`
+	repoConfig := filepath.Join(tmpDir, ".roborev.toml")
+	if err := os.WriteFile(repoConfig, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+
+	cfg, err := LoadRepoConfig(tmpDir)
+	if err != nil {
+		t.Fatalf("LoadRepoConfig failed: %v", err)
+	}
+
+	if cfg == nil {
+		t.Fatal("Expected non-nil config")
+	}
+
+	if cfg.Agent != "claude-code" {
+		t.Errorf("Expected agent 'claude-code', got '%s'", cfg.Agent)
+	}
+
+	if len(cfg.ReviewGuidelines) != 3 {
+		t.Errorf("Expected 3 guidelines, got %d", len(cfg.ReviewGuidelines))
+	}
+
+	expectedFirst := "We are not doing database migrations because there are no production databases yet"
+	if len(cfg.ReviewGuidelines) > 0 && cfg.ReviewGuidelines[0] != expectedFirst {
+		t.Errorf("Expected first guideline '%s', got '%s'", expectedFirst, cfg.ReviewGuidelines[0])
+	}
+}
+
+func TestLoadRepoConfigNoGuidelines(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Test loading config without review guidelines (backwards compatibility)
+	configContent := `agent = "codex"`
+	repoConfig := filepath.Join(tmpDir, ".roborev.toml")
+	if err := os.WriteFile(repoConfig, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+
+	cfg, err := LoadRepoConfig(tmpDir)
+	if err != nil {
+		t.Fatalf("LoadRepoConfig failed: %v", err)
+	}
+
+	if cfg == nil {
+		t.Fatal("Expected non-nil config")
+	}
+
+	if len(cfg.ReviewGuidelines) != 0 {
+		t.Errorf("Expected 0 guidelines, got %d", len(cfg.ReviewGuidelines))
+	}
+}
+
+func TestLoadRepoConfigMissing(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Test loading from directory with no config file
+	cfg, err := LoadRepoConfig(tmpDir)
+	if err != nil {
+		t.Fatalf("LoadRepoConfig failed: %v", err)
+	}
+
+	if cfg != nil {
+		t.Error("Expected nil config when file doesn't exist")
+	}
+}

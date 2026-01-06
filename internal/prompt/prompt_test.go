@@ -288,3 +288,139 @@ func TestPromptContainsExpectedFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildPromptWithProjectGuidelines(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create .roborev.toml with review guidelines
+	configContent := `
+agent = "codex"
+review_guidelines = [
+    "We are not doing database migrations because there are no production databases yet",
+    "Prefer composition over inheritance",
+    "All public APIs must have documentation comments"
+]
+`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Build prompt without database
+	prompt, err := BuildSimple(repoPath, targetSHA)
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should contain project guidelines section
+	if !strings.Contains(prompt, "## Project Guidelines") {
+		t.Error("Prompt should contain project guidelines section")
+	}
+
+	// Should contain each guideline
+	expectedGuidelines := []string{
+		"We are not doing database migrations because there are no production databases yet",
+		"Prefer composition over inheritance",
+		"All public APIs must have documentation comments",
+	}
+	for _, guideline := range expectedGuidelines {
+		if !strings.Contains(prompt, guideline) {
+			t.Errorf("Prompt should contain guideline: %s", guideline)
+		}
+	}
+
+	// Guidelines should appear as bullet points
+	if !strings.Contains(prompt, "- We are not doing") {
+		t.Error("Guidelines should be formatted as bullet points")
+	}
+
+	// Print prompt for inspection
+	t.Logf("Generated prompt with guidelines:\n%s", prompt)
+}
+
+func TestBuildPromptWithoutProjectGuidelines(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create .roborev.toml WITHOUT review guidelines
+	configContent := `agent = "codex"`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Build prompt
+	prompt, err := BuildSimple(repoPath, targetSHA)
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should NOT contain project guidelines section
+	if strings.Contains(prompt, "## Project Guidelines") {
+		t.Error("Prompt should not contain project guidelines section when none configured")
+	}
+}
+
+func TestBuildPromptNoConfig(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// No .roborev.toml at all
+
+	// Build prompt
+	prompt, err := BuildSimple(repoPath, targetSHA)
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Should NOT contain project guidelines section
+	if strings.Contains(prompt, "## Project Guidelines") {
+		t.Error("Prompt should not contain project guidelines section when no config file")
+	}
+
+	// Should still contain standard sections
+	if !strings.Contains(prompt, "You are a code reviewer") {
+		t.Error("Prompt should contain system prompt")
+	}
+	if !strings.Contains(prompt, "## Current Commit") {
+		t.Error("Prompt should contain current commit section")
+	}
+}
+
+func TestBuildPromptGuidelinesOrder(t *testing.T) {
+	repoPath, commits := setupTestRepo(t)
+	targetSHA := commits[len(commits)-1]
+
+	// Create .roborev.toml with review guidelines
+	configContent := `
+review_guidelines = ["Test guideline"]
+`
+	configPath := filepath.Join(repoPath, ".roborev.toml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write config: %v", err)
+	}
+
+	// Build prompt
+	prompt, err := BuildSimple(repoPath, targetSHA)
+	if err != nil {
+		t.Fatalf("BuildSimple failed: %v", err)
+	}
+
+	// Guidelines should appear after system prompt but before current commit
+	systemPromptPos := strings.Index(prompt, "You are a code reviewer")
+	guidelinesPos := strings.Index(prompt, "## Project Guidelines")
+	currentCommitPos := strings.Index(prompt, "## Current Commit")
+
+	if guidelinesPos == -1 {
+		t.Fatal("Guidelines section not found")
+	}
+
+	if systemPromptPos > guidelinesPos {
+		t.Error("System prompt should come before guidelines")
+	}
+
+	if guidelinesPos > currentCommitPos {
+		t.Error("Guidelines should come before current commit section")
+	}
+}

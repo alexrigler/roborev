@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/wesm/roborev/internal/config"
 	"github.com/wesm/roborev/internal/git"
 	"github.com/wesm/roborev/internal/storage"
 )
@@ -58,6 +59,14 @@ The following are reviews of recent commits in this repository. Use them as cont
 to understand ongoing work and to check if the current commit addresses previous feedback.
 `
 
+// ProjectGuidelinesHeader introduces the project-specific guidelines section
+const ProjectGuidelinesHeader = `
+## Project Guidelines
+
+The following are project-specific guidelines for this repository. Take these into account
+when reviewing the code - they may override or supplement the default review criteria.
+`
+
 // ReviewContext holds a commit SHA and its associated review (if any)
 type ReviewContext struct {
 	SHA    string
@@ -89,6 +98,11 @@ func (b *Builder) buildSinglePrompt(repoPath, sha string, repoID int64, contextC
 	// Start with system prompt
 	sb.WriteString(SystemPromptSingle)
 	sb.WriteString("\n")
+
+	// Add project-specific guidelines if configured
+	if repoCfg, err := config.LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
+		b.writeProjectGuidelines(&sb, repoCfg.ReviewGuidelines)
+	}
 
 	// Get previous reviews if requested
 	if contextCount > 0 && b.db != nil {
@@ -154,6 +168,11 @@ func (b *Builder) buildRangePrompt(repoPath, rangeRef string, repoID int64, cont
 	// Start with system prompt for ranges
 	sb.WriteString(SystemPromptRange)
 	sb.WriteString("\n")
+
+	// Add project-specific guidelines if configured
+	if repoCfg, err := config.LoadRepoConfig(repoPath); err == nil && repoCfg != nil {
+		b.writeProjectGuidelines(&sb, repoCfg.ReviewGuidelines)
+	}
 
 	// Get previous reviews from before the range start
 	if contextCount > 0 && b.db != nil {
@@ -240,6 +259,23 @@ func (b *Builder) writePreviousReviews(sb *strings.Builder, contexts []ReviewCon
 		}
 		sb.WriteString("\n\n")
 	}
+}
+
+// writeProjectGuidelines writes the project-specific guidelines section
+func (b *Builder) writeProjectGuidelines(sb *strings.Builder, guidelines []string) {
+	if len(guidelines) == 0 {
+		return
+	}
+
+	sb.WriteString(ProjectGuidelinesHeader)
+	sb.WriteString("\n")
+
+	for _, guideline := range guidelines {
+		sb.WriteString("- ")
+		sb.WriteString(guideline)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
 }
 
 // getPreviousReviewContexts gets the N commits before the target and looks up their reviews
