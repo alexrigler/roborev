@@ -32,7 +32,11 @@ fi
 echo "Using codex to generate changelog..." >&2
 echo "" >&2
 
-codex -p "You are generating a changelog for roborev version $VERSION.
+TMPFILE=$(mktemp)
+trap "rm -f $TMPFILE" EXIT
+
+codex exec --skip-git-repo-check -o "$TMPFILE" - <<EOF
+You are generating a changelog for roborev version $VERSION.
 
 Here are the commits since the last release:
 $COMMITS
@@ -47,4 +51,7 @@ Please generate a concise, user-focused changelog. Group changes into sections l
 
 Focus on user-visible changes. Skip internal refactoring unless it affects users.
 Keep descriptions brief (one line each). Use present tense.
-Output ONLY the changelog content, no preamble."
+Output ONLY the changelog content, no preamble.
+EOF
+
+cat "$TMPFILE"
