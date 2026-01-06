@@ -421,11 +421,11 @@ func (m tuiModel) renderQueueView() string {
 		b.WriteString("No jobs in queue\n")
 	} else {
 		// Header (with 2-char prefix to align with row selector)
-		header := fmt.Sprintf("  %-4s %-17s %-15s %-8s %-8s %-19s %-8s %s",
+		header := fmt.Sprintf("  %-4s %-17s %-15s %-8s %-8s %-12s %-8s %s",
 			"ID", "Ref", "Repo", "Agent", "Status", "Queued", "Elapsed", "Addr'd")
 		b.WriteString(tuiStatusStyle.Render(header))
 		b.WriteString("\n")
-		b.WriteString("  " + strings.Repeat("-", min(m.width-4, 86)))
+		b.WriteString("  " + strings.Repeat("-", min(m.width-4, 80)))
 		b.WriteString("\n")
 
 		// Calculate visible job range based on terminal height
@@ -493,8 +493,8 @@ func (m tuiModel) renderJobLine(job storage.ReviewJob) string {
 		agent = agent[:8]
 	}
 
-	// Format enqueue time as timestamp in local time
-	enqueued := job.EnqueuedAt.Local().Format("2006-01-02 15:04:05")
+	// Format enqueue time as compact timestamp in local time
+	enqueued := job.EnqueuedAt.Local().Format("Jan 02 15:04")
 
 	// Format elapsed time
 	elapsed := ""
@@ -537,7 +537,7 @@ func (m tuiModel) renderJobLine(job storage.ReviewJob) string {
 		}
 	}
 
-	return fmt.Sprintf("%-4d %-17s %-15s %-8s %s %-19s %-8s %s",
+	return fmt.Sprintf("%-4d %-17s %-15s %-8s %s %-12s %-8s %s",
 		job.ID, ref, repo, agent, styledStatus, enqueued, elapsed, addr)
 }
 
