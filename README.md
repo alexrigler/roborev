@@ -2,6 +2,8 @@
 
 Automatic code review for git commits using AI agents.
 
+![TUI Queue View](docs/screenshots/tui-queue.png)
+
 ## Install
 
 ```bash
