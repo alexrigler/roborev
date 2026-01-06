@@ -46,6 +46,7 @@ type ReviewJob struct {
 	RepoPath      string `json:"repo_path,omitempty"`
 	RepoName      string `json:"repo_name,omitempty"`
 	CommitSubject string `json:"commit_subject,omitempty"` // empty for ranges
+	Addressed     *bool  `json:"addressed,omitempty"`      // nil if no review yet
 }
 
 type Review struct {

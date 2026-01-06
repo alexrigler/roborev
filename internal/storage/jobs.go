@@ -170,10 +170,11 @@ func (db *DB) ListJobs(statusFilter string, limit int) ([]ReviewJob, error) {
 	query := `
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.agent, j.status, j.enqueued_at,
 		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt,
-		       r.root_path, r.name, c.subject
+		       r.root_path, r.name, c.subject, rv.addressed
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
+		LEFT JOIN reviews rv ON rv.job_id = j.id
 	`
 	var args []interface{}
 
@@ -202,10 +203,11 @@ func (db *DB) ListJobs(statusFilter string, limit int) ([]ReviewJob, error) {
 		var startedAt, finishedAt, workerID, errMsg, prompt sql.NullString
 		var commitID sql.NullInt64
 		var commitSubject sql.NullString
+		var addressed sql.NullInt64
 
 		err := rows.Scan(&j.ID, &j.RepoID, &commitID, &j.GitRef, &j.Agent, &j.Status, &enqueuedAt,
 			&startedAt, &finishedAt, &workerID, &errMsg, &prompt,
-			&j.RepoPath, &j.RepoName, &commitSubject)
+			&j.RepoPath, &j.RepoName, &commitSubject, &addressed)
 		if err != nil {
 			return nil, err
 		}
@@ -233,6 +235,10 @@ func (db *DB) ListJobs(statusFilter string, limit int) ([]ReviewJob, error) {
 		}
 		if prompt.Valid {
 			j.Prompt = prompt.String
+		}
+		if addressed.Valid {
+			val := addressed.Int64 != 0
+			j.Addressed = &val
 		}
 
 		jobs = append(jobs, j)

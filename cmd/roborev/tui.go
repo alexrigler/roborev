@@ -421,11 +421,11 @@ func (m tuiModel) renderQueueView() string {
 		b.WriteString("No jobs in queue\n")
 	} else {
 		// Header (with 2-char prefix to align with row selector)
-		header := fmt.Sprintf("  %-4s %-17s %-15s %-8s %-8s %-19s %s",
-			"ID", "Ref", "Repo", "Agent", "Status", "Queued", "Elapsed")
+		header := fmt.Sprintf("  %-4s %-17s %-15s %-8s %-8s %-19s %-8s %s",
+			"ID", "Ref", "Repo", "Agent", "Status", "Queued", "Elapsed", "Addr'd")
 		b.WriteString(tuiStatusStyle.Render(header))
 		b.WriteString("\n")
-		b.WriteString("  " + strings.Repeat("-", min(m.width-4, 78)))
+		b.WriteString("  " + strings.Repeat("-", min(m.width-4, 86)))
 		b.WriteString("\n")
 
 		// Calculate visible job range based on terminal height
@@ -527,8 +527,18 @@ func (m tuiModel) renderJobLine(job storage.ReviewJob) string {
 		styledStatus += strings.Repeat(" ", padding)
 	}
 
-	return fmt.Sprintf("%-4d %-17s %-15s %-8s %s %-19s %s",
-		job.ID, ref, repo, agent, styledStatus, enqueued, elapsed)
+	// Addressed status: nil means no review yet, true/false for reviewed jobs
+	addr := ""
+	if job.Addressed != nil {
+		if *job.Addressed {
+			addr = "true"
+		} else {
+			addr = "false"
+		}
+	}
+
+	return fmt.Sprintf("%-4d %-17s %-15s %-8s %s %-19s %-8s %s",
+		job.ID, ref, repo, agent, styledStatus, enqueued, elapsed, addr)
 }
 
 // wrapText wraps text to the specified width, preserving existing line breaks
