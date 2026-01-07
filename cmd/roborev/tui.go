@@ -448,7 +448,6 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(m.tick(), m.fetchJobs(), m.fetchStatus())
 
 	case tuiJobsMsg:
-		oldLen := len(m.jobs)
 		m.jobs = msg
 
 		if len(m.jobs) == 0 {
@@ -456,30 +455,24 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedJobID = 0
 		} else if m.selectedJobID > 0 {
 			// Try to find the previously selected job by ID
-			newIdx := -1
+			found := false
 			for i, job := range m.jobs {
 				if job.ID == m.selectedJobID {
-					newIdx = i
+					m.selectedIdx = i
+					found = true
 					break
 				}
 			}
 
-			// If too many new jobs added at once (20+), just keep current index
-			newJobs := len(m.jobs) - oldLen
-			if newIdx >= 0 && newJobs < 20 {
-				m.selectedIdx = newIdx
-			} else {
-				// Job not found or large batch - clamp to valid range
+			if !found {
+				// Job was removed - clamp index to valid range
 				m.selectedIdx = max(0, min(len(m.jobs)-1, m.selectedIdx))
-			}
-			// Update selectedJobID to match current selection
-			m.selectedJobID = m.jobs[m.selectedIdx].ID
-		} else {
-			// No job was selected yet, just clamp
-			m.selectedIdx = max(0, min(len(m.jobs)-1, m.selectedIdx))
-			if len(m.jobs) > 0 {
 				m.selectedJobID = m.jobs[m.selectedIdx].ID
 			}
+		} else {
+			// No job was selected yet, select first job
+			m.selectedIdx = 0
+			m.selectedJobID = m.jobs[0].ID
 		}
 
 	case tuiStatusMsg:
