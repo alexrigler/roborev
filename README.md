@@ -1,6 +1,6 @@
 # roborev
 
-Automatic code review for git commits using AI agents.
+Automatic code review for git commits using AI agents. Supports Claude Code, Codex, Copilot, and Gemini CLIs for code reviews.
 
 ![TUI Queue View](docs/screenshots/tui-queue.png)
 
