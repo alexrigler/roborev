@@ -79,18 +79,40 @@ func (wp *WorkerPool) CancelJob(jobID int64) bool {
 		cancel()
 		return true
 	}
+	wp.runningJobsMu.Unlock()
 
-	// Job not registered yet - check if it's a valid running job before marking pending
+	// Job not registered yet - check if it's a valid job before marking pending
 	// This prevents unbounded growth of pendingCancels for invalid/finished job IDs
+	// Note: we release the lock before the DB call to avoid blocking other operations
 	job, err := wp.db.GetJobByID(jobID)
-	if err != nil || (job.Status != storage.JobStatusRunning && job.Status != storage.JobStatusQueued) {
-		wp.runningJobsMu.Unlock()
+	if err != nil {
 		return false
 	}
 
-	// Valid job in cancellable state - mark for pending cancellation
+	// Accept jobs that are queued, running, OR canceled-but-claimed (race condition case)
+	// When db.CancelJob is called before workerPool.CancelJob, the status becomes 'canceled'
+	// but the worker may not have registered yet. We detect this via WorkerID being set.
+	isCancellable := job.Status == storage.JobStatusQueued ||
+		job.Status == storage.JobStatusRunning ||
+		(job.Status == storage.JobStatusCanceled && job.WorkerID != "")
+
+	if !isCancellable {
+		return false
+	}
+
+	// Re-lock and check if job was registered while we were checking DB
+	wp.runningJobsMu.Lock()
+	defer wp.runningJobsMu.Unlock()
+
+	// Check again if it's now registered (worker registered while we did DB lookup)
+	if cancel, ok := wp.runningJobs[jobID]; ok {
+		log.Printf("Canceling job %d (registered during DB check)", jobID)
+		cancel()
+		return true
+	}
+
+	// Mark for pending cancellation
 	wp.pendingCancels[jobID] = true
-	wp.runningJobsMu.Unlock()
 	log.Printf("Job %d not yet registered, marking for pending cancellation", jobID)
 	return true
 }

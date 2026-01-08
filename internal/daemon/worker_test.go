@@ -255,6 +255,83 @@ func TestWorkerPoolPendingCancellation(t *testing.T) {
 	pool.runningJobsMu.Unlock()
 }
 
+func TestWorkerPoolPendingCancellationAfterDBCancel(t *testing.T) {
+	// Test the real API path: db.CancelJob is called first (sets status to 'canceled'),
+	// then workerPool.CancelJob is called while worker hasn't registered yet.
+	// This simulates the race condition in handleCancelJob.
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open test DB: %v", err)
+	}
+	defer db.Close()
+
+	cfg := config.DefaultConfig()
+	pool := NewWorkerPool(db, cfg, 1)
+
+	// Create and claim a job (simulating worker claimed but not yet registered)
+	repo, err := db.GetOrCreateRepo(tmpDir)
+	if err != nil {
+		t.Fatalf("GetOrCreateRepo failed: %v", err)
+	}
+	commit, err := db.GetOrCreateCommit(repo.ID, "api-cancel-race", "Author", "Subject", time.Now())
+	if err != nil {
+		t.Fatalf("GetOrCreateCommit failed: %v", err)
+	}
+	job, err := db.EnqueueJob(repo.ID, commit.ID, "api-cancel-race", "test")
+	if err != nil {
+		t.Fatalf("EnqueueJob failed: %v", err)
+	}
+	claimed, err := db.ClaimJob("test-worker")
+	if err != nil {
+		t.Fatalf("ClaimJob failed: %v", err)
+	}
+	if claimed.ID != job.ID {
+		t.Fatalf("Expected to claim job %d, got %d", job.ID, claimed.ID)
+	}
+
+	// Simulate the API path: db.CancelJob is called first
+	if err := db.CancelJob(job.ID); err != nil {
+		t.Fatalf("db.CancelJob failed: %v", err)
+	}
+
+	// Verify status is now 'canceled' but WorkerID is still set
+	jobAfterDBCancel, err := db.GetJobByID(job.ID)
+	if err != nil {
+		t.Fatalf("GetJobByID failed: %v", err)
+	}
+	if jobAfterDBCancel.Status != storage.JobStatusCanceled {
+		t.Fatalf("Expected status 'canceled', got '%s'", jobAfterDBCancel.Status)
+	}
+	if jobAfterDBCancel.WorkerID == "" {
+		t.Fatal("Expected WorkerID to be set after claim")
+	}
+
+	// Now call workerPool.CancelJob (simulating second part of handleCancelJob)
+	// This should still work because job has WorkerID set (was claimed)
+	if !pool.CancelJob(job.ID) {
+		t.Error("CancelJob should return true for canceled-but-claimed job")
+	}
+
+	// Verify it's in pending cancels
+	pool.runningJobsMu.Lock()
+	inPending := pool.pendingCancels[job.ID]
+	pool.runningJobsMu.Unlock()
+	if !inPending {
+		t.Errorf("Job %d should be in pendingCancels", job.ID)
+	}
+
+	// Now register the job - should immediately cancel
+	canceled := false
+	pool.registerRunningJob(job.ID, func() { canceled = true })
+
+	if !canceled {
+		t.Error("Job should have been canceled immediately on registration")
+	}
+}
+
 func TestWorkerPoolCancelInvalidJob(t *testing.T) {
 	// Test that CancelJob returns false for non-existent jobs
 	tmpDir := t.TempDir()
