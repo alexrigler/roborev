@@ -1,10 +1,10 @@
 # roborev
 
-Automatic code review for git commits using AI agents. Supports Claude Code, Codex, Copilot, and Gemini CLIs for code reviews.
+Automatic code review for git commits using AI agents (Claude Code, Codex, Gemini, Copilot, OpenCode).
 
 ![TUI Queue View](docs/screenshots/tui-queue.png)
 
-## Install
+## Installation
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wesm/roborev/main/scripts/install.sh | bash
@@ -17,179 +17,133 @@ go install github.com/wesm/roborev/cmd/roborev@latest
 go install github.com/wesm/roborev/cmd/roborevd@latest
 ```
 
-Make sure `$GOPATH/bin` is in your PATH. Add to your shell config (e.g., `~/.zshrc`):
+Ensure `$GOPATH/bin` is in your PATH:
 
 ```bash
 export PATH="$PATH:$(go env GOPATH)/bin"
 ```
 
-Then restart your shell or run `source ~/.zshrc`.
-
 ## Quick Start
 
 ```bash
 cd your-repo
-roborev init
+roborev init          # Install post-commit hook
+git commit -m "..."   # Reviews happen automatically
+roborev tui           # View reviews in interactive UI
 ```
-
-This installs a post-commit hook. Every commit is now reviewed automatically.
-
-## Usage
-
-```bash
-roborev status       # Show queue and daemon status
-roborev show         # Show review for HEAD
-roborev show abc123  # Show review for specific commit
-roborev address 42   # Mark review #42 as addressed
-roborev tui          # Interactive terminal UI
-```
-
-### Reviewing Commit Ranges
-
-Review multiple commits at once:
-
-```bash
-roborev enqueue abc123 def456   # Review commits from abc123 to def456 (inclusive)
-```
-
-The range is inclusive of both endpoints. This is useful for reviewing a feature branch or a set of related commits together.
-
-## Configuration
-
-Per-repository `.roborev.toml`:
-
-```toml
-agent = "claude-code"    # codex, claude-code, gemini, copilot, or opencode
-review_context_count = 5
-
-# Project-specific review guidelines (multi-line string)
-review_guidelines = """
-We are not doing database migrations because there are no production databases yet.
-Prefer composition over inheritance.
-All public APIs must have documentation comments.
-"""
-```
-
-### Review Guidelines
-
-Use `review_guidelines` to provide project-specific context to the AI reviewer. These are included in every review prompt and can:
-
-- Suppress irrelevant warnings (e.g., "no migrations needed yet")
-- Enforce project conventions (e.g., "use tabs not spaces")
-- Add domain-specific review criteria (e.g., "check for PII exposure")
-
-Guidelines appear verbatim in the review prompt before the code diff. Use TOML's triple-quote syntax (`"""`) for multi-line guidelines.
-
-### Large Diffs
-
-If the review prompt exceeds 250KB (including the diff), roborev omits the diff and instead provides just the commit hash(es). The AI agent can then inspect the changes using its own tools (e.g., `git show <sha>`).
-
-Global `~/.roborev/config.toml`:
-
-```toml
-server_addr = "127.0.0.1:7373"
-max_workers = 4
-default_agent = "codex"
-```
-
-## Architecture
-
-roborev runs as a local daemon that processes review jobs in parallel.
-
-```
-~/.roborev/
-├── config.toml    # Configuration
-├── daemon.json    # Runtime state (port, PID)
-└── reviews.db     # SQLite database
-```
-
-The daemon starts automatically when needed and handles port conflicts by finding an available port.
-
-## Agents
-
-roborev supports multiple AI review agents:
-
-| Agent | CLI | Install |
-|-------|-----|---------|
-| `codex` | OpenAI Codex | `npm install -g @openai/codex` |
-| `claude-code` | Anthropic Claude Code | `npm install -g @anthropic-ai/claude-code` |
-| `gemini` | Google Gemini | `npm install -g @google/gemini-cli` |
-| `copilot` | GitHub Copilot | `npm install -g @github/copilot` |
-| `opencode` | OpenCode | `npm install -g opencode-ai` |
-
-### Automatic Fallback
-
-roborev automatically detects which agents are installed. If your preferred agent isn't available, it falls back in this order:
-
-```
-codex → claude-code → gemini → copilot → opencode
-```
-
-If none are installed, the job fails with a helpful error message.
-
-### Setting the Default Agent
-
-**Per-repository** - create `.roborev.toml` in the repo root:
-
-```toml
-agent = "gemini"
-```
-
-**Global default** - create or edit `~/.roborev/config.toml`:
-
-```toml
-default_agent = "claude-code"
-```
-
-**Per-command** - use the `--agent` flag:
-
-```bash
-roborev enqueue HEAD --agent copilot
-```
-
-### Selection Priority
-
-1. `--agent` flag on enqueue command
-2. Per-repo `.roborev.toml`
-3. Global `~/.roborev/config.toml`
-4. Automatic detection (first available: codex → claude-code → gemini → copilot → opencode)
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `roborev init` | Initialize in current repo |
+| `roborev init` | Initialize roborev in current repo |
 | `roborev status` | Show daemon and queue status |
-| `roborev show [sha]` | Display review |
-| `roborev address <id>` | Mark review as addressed |
-| `roborev enqueue [commit]` | Enqueue a single commit for review |
-| `roborev enqueue <start> <end>` | Enqueue a commit range for review |
-| `roborev daemon start\|stop\|restart` | Manage daemon |
-| `roborev install-hook` | Install git hook only |
 | `roborev tui` | Interactive terminal UI |
+| `roborev show [sha]` | Display review for commit |
+| `roborev address <id>` | Mark review as addressed |
+| `roborev enqueue <sha>` | Queue a commit for review |
+| `roborev enqueue <start> <end>` | Queue a commit range (inclusive) |
+| `roborev daemon start\|stop\|restart` | Manage the daemon |
+| `roborev install-hook` | Install git post-commit hook |
+| `roborev uninstall-hook` | Remove git post-commit hook |
 
-## TUI Keyboard Shortcuts
+## Configuration
 
-The interactive TUI (`roborev tui`) supports the following keys:
+### Per-Repository
+
+Create `.roborev.toml` in your repo root:
+
+```toml
+agent = "claude-code"      # AI agent to use
+review_context_count = 5   # Recent reviews to include as context
+
+# Project-specific review guidelines
+review_guidelines = """
+No database migrations needed - no production databases yet.
+Prefer composition over inheritance.
+All public APIs must have documentation comments.
+"""
+```
+
+### Global
+
+Create `~/.roborev/config.toml`:
+
+```toml
+default_agent = "codex"
+server_addr = "127.0.0.1:7373"
+max_workers = 4
+```
+
+### Priority Order
+
+1. `--agent` flag on command
+2. Per-repo `.roborev.toml`
+3. Global `~/.roborev/config.toml`
+4. Auto-detect first available agent
+
+### Review Guidelines
+
+Use `review_guidelines` to give the AI reviewer project-specific context:
+
+- Suppress irrelevant warnings ("no migrations needed yet")
+- Enforce conventions ("use tabs not spaces")
+- Add domain criteria ("check for PII exposure")
+
+### Large Diffs
+
+When a diff exceeds 250KB, roborev omits it from the prompt and provides only the commit hash. The AI agent can then inspect changes using its own tools (`git show <sha>`).
+
+## Agents
+
+| Agent | CLI Command | Install |
+|-------|-------------|---------|
+| `codex` | `codex` | `npm install -g @openai/codex` |
+| `claude-code` | `claude` | `npm install -g @anthropic-ai/claude-code` |
+| `gemini` | `gemini` | `npm install -g @google/gemini-cli` |
+| `copilot` | `github-copilot-cli` | `npm install -g @github/copilot` |
+| `opencode` | `opencode` | `npm install -g opencode-ai` |
+
+roborev auto-detects installed agents and falls back in order: codex → claude-code → gemini → copilot → opencode.
+
+## TUI
+
+The interactive terminal UI (`roborev tui`) provides a real-time view of the review queue.
 
 **Queue View:**
+
 | Key | Action |
 |-----|--------|
 | `↑`/`k`, `↓`/`j` | Navigate jobs |
-| `PgUp`, `PgDn` | Page through jobs |
+| `PgUp`, `PgDn` | Page through list |
 | `Enter` | View review |
 | `p` | View prompt |
-| `a` | Toggle addressed status |
+| `a` | Toggle addressed |
+| `x` | Cancel running/queued job |
 | `q` | Quit |
 
 **Review/Prompt View:**
+
 | Key | Action |
 |-----|--------|
 | `↑`/`k`, `↓`/`j` | Scroll content |
 | `PgUp`, `PgDn` | Page through content |
-| `a` | Toggle addressed status (review view) |
-| `p` | Toggle between review and prompt |
-| `Esc`/`q` | Back to queue |
+| `a` | Toggle addressed |
+| `p` | Switch between review/prompt |
+| `Esc`, `q` | Back to queue |
+
+## Architecture
+
+roborev runs as a local daemon that processes review jobs in parallel:
+
+```
+~/.roborev/
+├── config.toml    # Global configuration
+├── daemon.json    # Runtime state (port, PID)
+└── reviews.db     # SQLite database
+```
+
+The daemon starts automatically when needed and handles port conflicts gracefully.
 
 ## Development
 
