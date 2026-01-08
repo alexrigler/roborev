@@ -354,16 +354,9 @@ func TestInitCmdCreatesHooksDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	origPath := os.Getenv("PATH")
-	os.Setenv("PATH", binDir+":"+origPath)
+	os.Setenv("PATH", binDir+string(os.PathListSeparator)+origPath)
 	defer os.Setenv("PATH", origPath)
 
-	// Run init command
-	cmd = exec.Command("go", "run", "./cmd/roborev", "init", "--agent", "test")
-	cmd.Dir = filepath.Join(tmpDir, "..", "..", "..") // Go back to project root
-	cmd.Env = append(os.Environ(),
-		"HOME="+tmpHome,
-		"PATH="+binDir+":"+origPath,
-	)
 	// Change to the test repo directory before running
 	origWd, _ := os.Getwd()
 	if err := os.Chdir(tmpDir); err != nil {
@@ -399,5 +392,54 @@ func TestInitCmdCreatesHooksDirectory(t *testing.T) {
 	}
 	if info.Mode()&0111 == 0 {
 		t.Error("post-commit hook is not executable")
+	}
+}
+
+func TestInstallHookCmdCreatesHooksDirectory(t *testing.T) {
+	// Test that install-hook creates .git/hooks directory if missing
+	tmpDir := t.TempDir()
+
+	// Initialize git repo
+	cmd := exec.Command("git", "init")
+	cmd.Dir = tmpDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v\n%s", err, out)
+	}
+
+	// Remove .git/hooks directory
+	hooksDir := filepath.Join(tmpDir, ".git", "hooks")
+	if err := os.RemoveAll(hooksDir); err != nil {
+		t.Fatalf("Failed to remove hooks directory: %v", err)
+	}
+
+	// Verify hooks directory doesn't exist
+	if _, err := os.Stat(hooksDir); !os.IsNotExist(err) {
+		t.Fatal("hooks directory should not exist before test")
+	}
+
+	// Change to the test repo directory
+	origWd, _ := os.Getwd()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origWd)
+
+	// Run install-hook command
+	installCmd := installHookCmd()
+	err := installCmd.Execute()
+
+	if err != nil {
+		t.Fatalf("install-hook command failed: %v", err)
+	}
+
+	// Verify hooks directory was created
+	if _, err := os.Stat(hooksDir); os.IsNotExist(err) {
+		t.Error("hooks directory was not created")
+	}
+
+	// Verify hook file was created
+	hookPath := filepath.Join(hooksDir, "post-commit")
+	if _, err := os.Stat(hookPath); os.IsNotExist(err) {
+		t.Error("post-commit hook was not created")
 	}
 }
