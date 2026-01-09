@@ -388,6 +388,12 @@ Examples:
   roborev enqueue abc123 def456  # Review range from abc123 to def456 (inclusive)
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// In quiet mode, suppress cobra's error output (hook uses &, so exit code doesn't matter)
+			if quiet {
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
+			}
+
 			// Default to current directory
 			if repoPath == "" {
 				repoPath = "."
@@ -397,22 +403,22 @@ Examples:
 			root, err := git.GetRepoRoot(repoPath)
 			if err != nil {
 				if quiet {
-					return nil // Silent exit in quiet mode
+					return nil // Not a repo - silent exit for hooks
 				}
 				return fmt.Errorf("not a git repository: %w", err)
 			}
 
 			// Skip during rebase to avoid reviewing every replayed commit
 			if git.IsRebaseInProgress(root) {
-				return nil // Silent exit
+				if !quiet {
+					fmt.Println("Skipping: rebase in progress")
+				}
+				return nil // Intentional skip, exit 0
 			}
 
 			// Ensure daemon is running
 			if err := ensureDaemon(); err != nil {
-				if quiet {
-					return nil
-				}
-				return err
+				return err // Return error (quiet mode silences output, not exit code)
 			}
 
 			var gitRef string
