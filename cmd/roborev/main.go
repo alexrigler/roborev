@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -48,6 +52,7 @@ func main() {
 	rootCmd.AddCommand(installHookCmd())
 	rootCmd.AddCommand(uninstallHookCmd())
 	rootCmd.AddCommand(daemonCmd())
+	rootCmd.AddCommand(streamCmd())
 	rootCmd.AddCommand(tuiCmd())
 	rootCmd.AddCommand(updateCmd())
 	rootCmd.AddCommand(versionCmd())
@@ -70,19 +75,23 @@ func getDaemonAddr() string {
 func ensureDaemon() error {
 	client := &http.Client{Timeout: 500 * time.Millisecond}
 
-	// First check runtime file for daemon address and version
+	// First check runtime file for daemon address
 	if info, err := daemon.ReadRuntime(); err == nil {
 		addr := fmt.Sprintf("http://%s/api/status", info.Addr)
 		resp, err := client.Get(addr)
 		if err == nil {
-			resp.Body.Close()
+			defer resp.Body.Close()
 
-			// Check version match - restart if versions differ
-			// For dirty builds, also restart if daemon is non-dirty (newer clean build)
-			// but don't restart if both are the same dirty version
-			if info.Version != version.Version {
+			// Parse response to get actual daemon version
+			var status struct {
+				Version string `json:"version"`
+			}
+			decodeErr := json.NewDecoder(resp.Body).Decode(&status)
+
+			// Fail closed: restart if decode fails, version empty, or mismatch
+			if decodeErr != nil || status.Version == "" || status.Version != version.Version {
 				if verbose {
-					fmt.Printf("Daemon version mismatch (daemon: %s, cli: %s), restarting...\n", info.Version, version.Version)
+					fmt.Printf("Daemon version mismatch or unreadable (daemon: %s, cli: %s), restarting...\n", status.Version, version.Version)
 				}
 				return restartDaemon()
 			}
@@ -92,10 +101,22 @@ func ensureDaemon() error {
 		}
 	}
 
-	// Try default address
+	// Try default address - also check version from response
 	resp, err := client.Get(serverAddr + "/api/status")
 	if err == nil {
-		resp.Body.Close()
+		defer resp.Body.Close()
+		var status struct {
+			Version string `json:"version"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&status)
+
+		// Fail closed: restart if decode fails, version empty, or mismatch
+		if decodeErr != nil || status.Version == "" || status.Version != version.Version {
+			if verbose {
+				fmt.Printf("Daemon version mismatch or unreadable (daemon: %s, cli: %s), restarting...\n", status.Version, version.Version)
+			}
+			return restartDaemon()
+		}
 		return nil
 	}
 
@@ -712,6 +733,94 @@ func addressCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&unaddress, "unaddress", false, "mark as unaddressed instead")
+
+	return cmd
+}
+
+func streamCmd() *cobra.Command {
+	var repoFilter string
+
+	cmd := &cobra.Command{
+		Use:   "stream",
+		Short: "Stream review events in real-time",
+		Long: `Stream review events from the daemon in real-time.
+
+Events are printed as JSONL (one JSON object per line).
+
+Examples:
+  roborev stream              # Stream all events
+  roborev stream --repo .     # Stream events for current repo only
+`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Ensure daemon is running
+			if err := ensureDaemon(); err != nil {
+				return fmt.Errorf("daemon not running: %w", err)
+			}
+
+			// Resolve repo filter if set - use main repo root for worktree compatibility
+			if repoFilter != "" {
+				root, err := git.GetMainRepoRoot(repoFilter)
+				if err != nil {
+					return fmt.Errorf("resolve repo path: %w", err)
+				}
+				repoFilter = root
+			}
+
+			// Build URL with optional repo filter
+			addr := getDaemonAddr()
+			streamURL := addr + "/api/stream/events"
+			if repoFilter != "" {
+				streamURL += "?" + url.Values{"repo": {repoFilter}}.Encode()
+			}
+
+			// Create request
+			req, err := http.NewRequest("GET", streamURL, nil)
+			if err != nil {
+				return fmt.Errorf("create request: %w", err)
+			}
+
+			// Set up context for Ctrl+C handling
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req = req.WithContext(ctx)
+
+			// Handle Ctrl+C
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, os.Interrupt)
+			go func() {
+				<-sigCh
+				cancel()
+			}()
+
+			// Make request
+			client := &http.Client{Timeout: 0} // No timeout for streaming
+			resp, err := client.Do(req)
+			if err != nil {
+				return fmt.Errorf("connect to daemon: %w", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				return fmt.Errorf("stream failed: %s", body)
+			}
+
+			// Stream events - pass through lines directly to preserve all fields
+			scanner := bufio.NewScanner(resp.Body)
+			for scanner.Scan() {
+				if ctx.Err() != nil {
+					return nil
+				}
+				fmt.Println(scanner.Text())
+			}
+			if err := scanner.Err(); err != nil && ctx.Err() == nil {
+				return fmt.Errorf("read stream: %w", err)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&repoFilter, "repo", "", "filter events by repository path")
 
 	return cmd
 }

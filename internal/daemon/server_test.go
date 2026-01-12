@@ -1,19 +1,83 @@
 package daemon
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/wesm/roborev/internal/config"
 	"github.com/wesm/roborev/internal/storage"
 )
+
+// safeRecorder wraps httptest.ResponseRecorder with mutex protection for concurrent access
+type safeRecorder struct {
+	*httptest.ResponseRecorder
+	mu sync.Mutex
+}
+
+func newSafeRecorder() *safeRecorder {
+	return &safeRecorder{ResponseRecorder: httptest.NewRecorder()}
+}
+
+func (s *safeRecorder) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ResponseRecorder.Write(p)
+}
+
+func (s *safeRecorder) WriteHeader(code int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ResponseRecorder.WriteHeader(code)
+}
+
+func (s *safeRecorder) Header() http.Header {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ResponseRecorder.Header()
+}
+
+func (s *safeRecorder) bodyString() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Body.String()
+}
+
+// waitForSubscriberIncrease polls until subscriber count increases from initialCount
+func waitForSubscriberIncrease(b Broadcaster, initialCount int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if b.SubscriberCount() > initialCount {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+// waitForEvents polls until the response body contains at least minEvents newline-delimited events
+func waitForEvents(w *safeRecorder, minEvents int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		body := w.bodyString()
+		count := strings.Count(body, "\n")
+		if count >= minEvents {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
 
 func TestHandleListRepos(t *testing.T) {
 	tmpDir := t.TempDir()
@@ -696,6 +760,473 @@ func TestListJobsPagination(t *testing.T) {
 		// Should return all 10 jobs since offset is ignored with limit=0
 		if len(result.Jobs) != 10 {
 			t.Errorf("Expected 10 jobs (offset ignored with limit=0), got %d", len(result.Jobs))
+		}
+	})
+}
+
+func TestHandleStreamEvents(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	db, err := storage.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open test DB: %v", err)
+	}
+	defer db.Close()
+
+	cfg := config.DefaultConfig()
+	server := NewServer(db, cfg)
+
+	t.Run("returns correct headers", func(t *testing.T) {
+		// Create a request with a context that we can cancel
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/events", nil).WithContext(ctx)
+		w := newSafeRecorder()
+
+		// Capture initial subscriber count to detect when this handler subscribes
+		initialCount := server.broadcaster.SubscriberCount()
+
+		// Run handler in goroutine since it blocks
+		done := make(chan struct{})
+		go func() {
+			server.handleStreamEvents(w, req)
+			close(done)
+		}()
+
+		// Wait for handler to subscribe
+		if !waitForSubscriberIncrease(server.broadcaster, initialCount, time.Second) {
+			t.Fatal("Timed out waiting for subscriber")
+		}
+
+		// Cancel request to stop the handler
+		cancel()
+		<-done
+
+		// Check headers
+		if ct := w.Header().Get("Content-Type"); ct != "application/x-ndjson" {
+			t.Errorf("Expected Content-Type 'application/x-ndjson', got '%s'", ct)
+		}
+		if cc := w.Header().Get("Cache-Control"); cc != "no-cache" {
+			t.Errorf("Expected Cache-Control 'no-cache', got '%s'", cc)
+		}
+		if conn := w.Header().Get("Connection"); conn != "keep-alive" {
+			t.Errorf("Expected Connection 'keep-alive', got '%s'", conn)
+		}
+	})
+
+	t.Run("wrong method fails", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/stream/events", nil)
+		w := httptest.NewRecorder()
+
+		server.handleStreamEvents(w, req)
+
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("Expected status 405 for POST, got %d", w.Code)
+		}
+	})
+
+	t.Run("streams events as JSONL", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/events", nil).WithContext(ctx)
+		w := newSafeRecorder()
+
+		initialCount := server.broadcaster.SubscriberCount()
+
+		// Run handler in goroutine
+		done := make(chan struct{})
+		go func() {
+			server.handleStreamEvents(w, req)
+			close(done)
+		}()
+
+		// Wait for handler to subscribe
+		if !waitForSubscriberIncrease(server.broadcaster, initialCount, time.Second) {
+			t.Fatal("Timed out waiting for subscriber")
+		}
+
+		// Broadcast test events
+		event1 := Event{
+			Type:     "review.completed",
+			TS:       time.Now(),
+			JobID:    1,
+			Repo:     "/test/repo1",
+			RepoName: "repo1",
+			SHA:      "abc123",
+			Agent:    "test",
+			Verdict:  "pass",
+		}
+		event2 := Event{
+			Type:     "review.failed",
+			TS:       time.Now(),
+			JobID:    2,
+			Repo:     "/test/repo2",
+			RepoName: "repo2",
+			SHA:      "def456",
+			Agent:    "test",
+			Error:    "agent timeout",
+		}
+		server.broadcaster.Broadcast(event1)
+		server.broadcaster.Broadcast(event2)
+
+		// Wait for events to be written
+		if !waitForEvents(w, 2, time.Second) {
+			t.Fatal("Timed out waiting for events")
+		}
+
+		// Cancel and wait for handler to finish
+		cancel()
+		<-done
+
+		// Parse JSONL output (safe to read body after handler done)
+		body := w.bodyString()
+		scanner := bufio.NewScanner(bytes.NewBufferString(body))
+		var events []Event
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			var ev Event
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("Failed to parse JSONL line: %v, line: %s", err, line)
+			}
+			events = append(events, ev)
+		}
+
+		if len(events) != 2 {
+			t.Fatalf("Expected 2 events, got %d", len(events))
+		}
+
+		if events[0].Type != "review.completed" || events[0].JobID != 1 {
+			t.Errorf("First event mismatch: %+v", events[0])
+		}
+		if events[0].RepoName != "repo1" {
+			t.Errorf("Expected RepoName 'repo1', got '%s'", events[0].RepoName)
+		}
+		if events[0].Verdict != "pass" {
+			t.Errorf("Expected Verdict 'pass', got '%s'", events[0].Verdict)
+		}
+		if events[1].Type != "review.failed" || events[1].JobID != 2 {
+			t.Errorf("Second event mismatch: %+v", events[1])
+		}
+		if events[1].Error != "agent timeout" {
+			t.Errorf("Expected Error 'agent timeout', got '%s'", events[1].Error)
+		}
+	})
+
+	t.Run("all event types are supported", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/events", nil).WithContext(ctx)
+		w := newSafeRecorder()
+
+		initialCount := server.broadcaster.SubscriberCount()
+
+		done := make(chan struct{})
+		go func() {
+			server.handleStreamEvents(w, req)
+			close(done)
+		}()
+
+		if !waitForSubscriberIncrease(server.broadcaster, initialCount, time.Second) {
+			t.Fatal("Timed out waiting for subscriber")
+		}
+
+		// Broadcast all event types
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.started",
+			JobID:    1,
+			Repo:     "/test/repo",
+			RepoName: "repo",
+			SHA:      "abc",
+			Agent:    "codex",
+		})
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.completed",
+			JobID:    1,
+			Repo:     "/test/repo",
+			RepoName: "repo",
+			SHA:      "abc",
+			Agent:    "codex",
+			Verdict:  "pass",
+		})
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.failed",
+			JobID:    2,
+			Repo:     "/test/repo",
+			RepoName: "repo",
+			SHA:      "def",
+			Agent:    "codex",
+			Error:    "connection refused",
+		})
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.canceled",
+			JobID:    3,
+			Repo:     "/test/repo",
+			RepoName: "repo",
+			SHA:      "ghi",
+			Agent:    "codex",
+		})
+
+		if !waitForEvents(w, 4, time.Second) {
+			t.Fatal("Timed out waiting for events")
+		}
+		cancel()
+		<-done
+
+		body := w.bodyString()
+		lines := strings.Split(strings.TrimSpace(body), "\n")
+
+		// Parse into maps to check actual key presence (not just empty values)
+		var rawEvents []map[string]interface{}
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			var raw map[string]interface{}
+			if err := json.Unmarshal([]byte(line), &raw); err != nil {
+				t.Fatalf("Failed to parse JSONL: %v", err)
+			}
+			rawEvents = append(rawEvents, raw)
+		}
+
+		expectedTypes := []string{"review.started", "review.completed", "review.failed", "review.canceled"}
+		if len(rawEvents) != len(expectedTypes) {
+			t.Fatalf("Expected %d events, got %d", len(expectedTypes), len(rawEvents))
+		}
+		for i, exp := range expectedTypes {
+			if rawEvents[i]["type"] != exp {
+				t.Errorf("Event %d: expected type '%s', got '%v'", i, exp, rawEvents[i]["type"])
+			}
+		}
+
+		// Verify error field is present (key exists) for failed event and absent for others
+		for i, raw := range rawEvents {
+			eventType, ok := raw["type"].(string)
+			if !ok {
+				t.Fatalf("Event %d: 'type' key missing or not a string", i)
+			}
+			errorVal, hasError := raw["error"]
+			if eventType == "review.failed" {
+				if !hasError {
+					t.Error("Expected 'error' key present in review.failed event")
+				} else if errorStr, ok := errorVal.(string); !ok || errorStr != "connection refused" {
+					t.Errorf("Expected error 'connection refused', got %v", errorVal)
+				}
+			} else {
+				if hasError {
+					t.Errorf("Unexpected 'error' key in %s event", eventType)
+				}
+			}
+		}
+
+		// Verify verdict field is present (key exists) only in completed event
+		for i, raw := range rawEvents {
+			eventType, ok := raw["type"].(string)
+			if !ok {
+				t.Fatalf("Event %d: 'type' key missing or not a string", i)
+			}
+			verdictVal, hasVerdict := raw["verdict"]
+			if eventType == "review.completed" {
+				if !hasVerdict {
+					t.Error("Expected 'verdict' key present in review.completed event")
+				} else if verdictStr, ok := verdictVal.(string); !ok || verdictStr != "pass" {
+					t.Errorf("Expected verdict 'pass', got %v", verdictVal)
+				}
+			} else {
+				if hasVerdict {
+					t.Errorf("Unexpected 'verdict' key in %s event", eventType)
+				}
+			}
+		}
+	})
+
+	t.Run("omitempty fields are excluded when empty", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/events", nil).WithContext(ctx)
+		w := newSafeRecorder()
+
+		initialCount := server.broadcaster.SubscriberCount()
+
+		done := make(chan struct{})
+		go func() {
+			server.handleStreamEvents(w, req)
+			close(done)
+		}()
+
+		if !waitForSubscriberIncrease(server.broadcaster, initialCount, time.Second) {
+			t.Fatal("Timed out waiting for subscriber")
+		}
+
+		// Event with no optional fields set
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.started",
+			JobID:    1,
+			Repo:     "/test/repo",
+			RepoName: "repo",
+			SHA:      "abc",
+			// Agent, Verdict, Error all empty
+		})
+
+		if !waitForEvents(w, 1, time.Second) {
+			t.Fatal("Timed out waiting for events")
+		}
+		cancel()
+		<-done
+
+		body := w.bodyString()
+		// Check that empty fields are not in the JSON output
+		if bytes.Contains([]byte(body), []byte(`"verdict"`)) {
+			t.Error("Expected 'verdict' to be omitted when empty")
+		}
+		if bytes.Contains([]byte(body), []byte(`"error"`)) {
+			t.Error("Expected 'error' to be omitted when empty")
+		}
+	})
+
+	t.Run("repo filter only sends matching events", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		// Filter for repo1 only
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/events?repo="+url.QueryEscape("/test/repo1"), nil).WithContext(ctx)
+		w := newSafeRecorder()
+
+		initialCount := server.broadcaster.SubscriberCount()
+
+		// Run handler in goroutine
+		done := make(chan struct{})
+		go func() {
+			server.handleStreamEvents(w, req)
+			close(done)
+		}()
+
+		if !waitForSubscriberIncrease(server.broadcaster, initialCount, time.Second) {
+			t.Fatal("Timed out waiting for subscriber")
+		}
+
+		// Broadcast events for different repos
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.completed",
+			JobID:    10,
+			Repo:     "/test/repo1",
+			RepoName: "repo1",
+			SHA:      "aaa",
+		})
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.completed",
+			JobID:    11,
+			Repo:     "/test/repo2", // Should be filtered out
+			RepoName: "repo2",
+			SHA:      "bbb",
+		})
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.completed",
+			JobID:    12,
+			Repo:     "/test/repo1",
+			RepoName: "repo1",
+			SHA:      "ccc",
+		})
+
+		// Wait for events to be written (expect 2 for repo1, repo2 event is filtered)
+		if !waitForEvents(w, 2, time.Second) {
+			t.Fatal("Timed out waiting for events")
+		}
+
+		// Cancel and wait
+		cancel()
+		<-done
+
+		// Parse JSONL output
+		body := w.bodyString()
+		scanner := bufio.NewScanner(bytes.NewBufferString(body))
+		var events []Event
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			var ev Event
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("Failed to parse JSONL line: %v", err)
+			}
+			events = append(events, ev)
+		}
+
+		// Should only have 2 events (repo1), not the repo2 event
+		if len(events) != 2 {
+			t.Fatalf("Expected 2 events (filtered), got %d", len(events))
+		}
+
+		for _, ev := range events {
+			if ev.Repo != "/test/repo1" {
+				t.Errorf("Expected all events for /test/repo1, got event for %s", ev.Repo)
+			}
+		}
+	})
+
+	t.Run("special characters in repo filter are handled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		// Repo path with spaces
+		repoPath := "/test/my repo with spaces"
+		req := httptest.NewRequest(http.MethodGet, "/api/stream/events?repo="+url.QueryEscape(repoPath), nil).WithContext(ctx)
+		w := newSafeRecorder()
+
+		initialCount := server.broadcaster.SubscriberCount()
+
+		// Run handler in goroutine
+		done := make(chan struct{})
+		go func() {
+			server.handleStreamEvents(w, req)
+			close(done)
+		}()
+
+		if !waitForSubscriberIncrease(server.broadcaster, initialCount, time.Second) {
+			t.Fatal("Timed out waiting for subscriber")
+		}
+
+		// Broadcast event for the repo with spaces
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.completed",
+			JobID:    20,
+			Repo:     repoPath,
+			RepoName: "my repo with spaces",
+			SHA:      "xyz",
+		})
+		// Broadcast event for different repo (should be filtered)
+		server.broadcaster.Broadcast(Event{
+			Type:     "review.completed",
+			JobID:    21,
+			Repo:     "/test/other",
+			RepoName: "other",
+			SHA:      "zzz",
+		})
+
+		// Wait for the event that passes filter
+		if !waitForEvents(w, 1, time.Second) {
+			t.Fatal("Timed out waiting for events")
+		}
+		cancel()
+		<-done
+
+		// Parse output
+		body := w.bodyString()
+		scanner := bufio.NewScanner(bytes.NewBufferString(body))
+		var events []Event
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				continue
+			}
+			var ev Event
+			if err := json.Unmarshal([]byte(line), &ev); err != nil {
+				t.Fatalf("Failed to parse JSONL line: %v", err)
+			}
+			events = append(events, ev)
+		}
+
+		if len(events) != 1 {
+			t.Fatalf("Expected 1 event for repo with spaces, got %d", len(events))
+		}
+		if events[0].Repo != repoPath {
+			t.Errorf("Expected repo '%s', got '%s'", repoPath, events[0].Repo)
 		}
 	})
 }

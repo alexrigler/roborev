@@ -19,6 +19,7 @@ type WorkerPool struct {
 	db            *storage.DB
 	cfg           *config.Config
 	promptBuilder *prompt.Builder
+	broadcaster   Broadcaster
 
 	numWorkers    int
 	activeWorkers atomic.Int32
@@ -35,11 +36,12 @@ type WorkerPool struct {
 }
 
 // NewWorkerPool creates a new worker pool
-func NewWorkerPool(db *storage.DB, cfg *config.Config, numWorkers int) *WorkerPool {
+func NewWorkerPool(db *storage.DB, cfg *config.Config, numWorkers int, broadcaster Broadcaster) *WorkerPool {
 	return &WorkerPool{
 		db:             db,
 		cfg:            cfg,
 		promptBuilder:  prompt.NewBuilder(db),
+		broadcaster:    broadcaster,
 		numWorkers:     numWorkers,
 		stopCh:         make(chan struct{}),
 		runningJobs:    make(map[int64]context.CancelFunc),
@@ -239,7 +241,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	reviewPrompt, err := wp.promptBuilder.Build(job.RepoPath, job.GitRef, job.RepoID, wp.cfg.ReviewContextCount)
 	if err != nil {
 		log.Printf("[%s] Error building prompt: %v", workerID, err)
-		wp.failOrRetry(workerID, job.ID, fmt.Sprintf("build prompt: %v", err))
+		wp.failOrRetry(workerID, job, job.Agent, fmt.Sprintf("build prompt: %v", err))
 		return
 	}
 
@@ -252,7 +254,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	a, err := agent.GetAvailable(job.Agent)
 	if err != nil {
 		log.Printf("[%s] Error getting agent: %v", workerID, err)
-		wp.failOrRetry(workerID, job.ID, fmt.Sprintf("get agent: %v", err))
+		wp.failOrRetry(workerID, job, job.Agent, fmt.Sprintf("get agent: %v", err))
 		return
 	}
 
@@ -262,6 +264,17 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		log.Printf("[%s] Agent %s not available, using %s", workerID, job.Agent, agentName)
 	}
 
+	// Broadcast started event
+	wp.broadcaster.Broadcast(Event{
+		Type:     "review.started",
+		TS:       time.Now(),
+		JobID:    job.ID,
+		Repo:     job.RepoPath,
+		RepoName: job.RepoName,
+		SHA:      job.GitRef,
+		Agent:    agentName,
+	})
+
 	// Run the review
 	log.Printf("[%s] Running %s review...", workerID, agentName)
 	output, err := a.Review(ctx, job.RepoPath, job.GitRef, reviewPrompt)
@@ -269,10 +282,20 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		// Check if this was a cancellation
 		if ctx.Err() == context.Canceled {
 			log.Printf("[%s] Job %d was canceled", workerID, job.ID)
+			// Broadcast cancellation event
+			wp.broadcaster.Broadcast(Event{
+				Type:     "review.canceled",
+				TS:       time.Now(),
+				JobID:    job.ID,
+				Repo:     job.RepoPath,
+				RepoName: job.RepoName,
+				SHA:      job.GitRef,
+				Agent:    agentName,
+			})
 			return // Job already marked as canceled in DB, nothing more to do
 		}
 		log.Printf("[%s] Agent error: %v", workerID, err)
-		wp.failOrRetry(workerID, job.ID, fmt.Sprintf("agent: %v", err))
+		wp.failOrRetry(workerID, job, agentName, fmt.Sprintf("agent: %v", err))
 		return
 	}
 
@@ -283,22 +306,51 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	}
 
 	log.Printf("[%s] Completed job %d", workerID, job.ID)
+
+	// Broadcast completion event
+	verdict := storage.ParseVerdict(output)
+	wp.broadcaster.Broadcast(Event{
+		Type:     "review.completed",
+		TS:       time.Now(),
+		JobID:    job.ID,
+		Repo:     job.RepoPath,
+		RepoName: job.RepoName,
+		SHA:      job.GitRef,
+		Agent:    agentName,
+		Verdict:  verdict,
+	})
 }
 
 // failOrRetry attempts to retry the job, or marks it as failed if max retries reached
-func (wp *WorkerPool) failOrRetry(workerID string, jobID int64, errorMsg string) {
-	retried, err := wp.db.RetryJob(jobID, maxRetries)
+func (wp *WorkerPool) failOrRetry(workerID string, job *storage.ReviewJob, agentName string, errorMsg string) {
+	retried, err := wp.db.RetryJob(job.ID, maxRetries)
 	if err != nil {
 		log.Printf("[%s] Error retrying job: %v", workerID, err)
-		wp.db.FailJob(jobID, errorMsg)
+		wp.db.FailJob(job.ID, errorMsg)
+		wp.broadcastFailed(job, agentName, errorMsg)
 		return
 	}
 
 	if retried {
-		retryCount, _ := wp.db.GetJobRetryCount(jobID)
-		log.Printf("[%s] Job %d queued for retry (%d/%d)", workerID, jobID, retryCount, maxRetries)
+		retryCount, _ := wp.db.GetJobRetryCount(job.ID)
+		log.Printf("[%s] Job %d queued for retry (%d/%d)", workerID, job.ID, retryCount, maxRetries)
 	} else {
-		log.Printf("[%s] Job %d failed after %d retries", workerID, jobID, maxRetries)
-		wp.db.FailJob(jobID, errorMsg)
+		log.Printf("[%s] Job %d failed after %d retries", workerID, job.ID, maxRetries)
+		wp.db.FailJob(job.ID, errorMsg)
+		wp.broadcastFailed(job, agentName, errorMsg)
 	}
+}
+
+// broadcastFailed sends a review.failed event for a job
+func (wp *WorkerPool) broadcastFailed(job *storage.ReviewJob, agentName, errorMsg string) {
+	wp.broadcaster.Broadcast(Event{
+		Type:     "review.failed",
+		TS:       time.Now(),
+		JobID:    job.ID,
+		Repo:     job.RepoPath,
+		RepoName: job.RepoName,
+		SHA:      job.GitRef,
+		Agent:    agentName,
+		Error:    errorMsg,
+	})
 }
