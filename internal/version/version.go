@@ -7,6 +7,7 @@ import (
 
 // Version is the build version. Set via -ldflags for releases,
 // otherwise falls back to git commit hash from VCS info.
+// For dev builds with git describe version, use: make install
 var Version = "dev"
 
 func init() {

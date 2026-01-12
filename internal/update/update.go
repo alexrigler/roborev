@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	githubAPIURL  = "https://api.github.com/repos/wesm/roborev/releases/latest"
-	cacheFileName = "update_check.json"
-	cacheDuration = 1 * time.Hour
+	githubAPIURL      = "https://api.github.com/repos/wesm/roborev/releases/latest"
+	cacheFileName     = "update_check.json"
+	cacheDuration     = 1 * time.Hour
+	devCacheDuration  = 15 * time.Minute // Shorter cache for dev builds
 )
 
 // Release represents a GitHub release
@@ -48,6 +49,7 @@ type UpdateInfo struct {
 	AssetName      string
 	Size           int64
 	Checksum       string // SHA256 if available
+	IsDevBuild     bool   // True if running a dev build (hash version)
 }
 
 // findAssets locates the platform-specific binary and checksums file from release assets
@@ -74,16 +76,31 @@ type cachedCheck struct {
 // Uses a 1-hour cache to avoid hitting GitHub API too often
 func CheckForUpdate(forceCheck bool) (*UpdateInfo, error) {
 	currentVersion := strings.TrimPrefix(version.Version, "v")
+	isDevBuild := extractBaseSemver(currentVersion) == ""
 
 	// Check cache first (unless forced)
+	// Use shorter cache for dev builds so they learn about releases sooner
+	cacheWindow := cacheDuration
+	if isDevBuild {
+		cacheWindow = devCacheDuration
+	}
 	if !forceCheck {
 		if cached, err := loadCache(); err == nil {
-			if time.Since(cached.CheckedAt) < cacheDuration {
+			if time.Since(cached.CheckedAt) < cacheWindow {
 				latestVersion := strings.TrimPrefix(cached.Version, "v")
-				if !isNewer(latestVersion, currentVersion) {
+				if !isDevBuild && !isNewer(latestVersion, currentVersion) {
 					return nil, nil // Up to date (cached)
 				}
-				// Cache says update available, fetch fresh info
+				// For dev builds, return cached version (notification only needs version)
+				// Full download info is fetched when actually updating (forceCheck=true)
+				if isDevBuild {
+					return &UpdateInfo{
+						CurrentVersion: version.Version,
+						LatestVersion:  cached.Version,
+						IsDevBuild:     true,
+					}, nil
+				}
+				// Cache says update available, fetch fresh info for download URLs
 			}
 		}
 	}
@@ -98,7 +115,10 @@ func CheckForUpdate(forceCheck bool) (*UpdateInfo, error) {
 	saveCache(release.TagName)
 
 	latestVersion := strings.TrimPrefix(release.TagName, "v")
-	if !isNewer(latestVersion, currentVersion) {
+
+	// For dev builds, always notify about the latest release
+	// For regular builds, only notify if there's a newer version
+	if !isDevBuild && !isNewer(latestVersion, currentVersion) {
 		return nil, nil // Up to date
 	}
 
@@ -127,6 +147,7 @@ func CheckForUpdate(forceCheck bool) (*UpdateInfo, error) {
 		AssetName:      asset.Name,
 		Size:           asset.Size,
 		Checksum:       checksum,
+		IsDevBuild:     isDevBuild,
 	}, nil
 }
 
@@ -509,37 +530,50 @@ func saveCache(version string) {
 	os.WriteFile(cachePath, data, 0644)
 }
 
-// isSemver returns true if the version looks like semver (contains at least one dot
-// and starts with a digit)
-func isSemver(v string) bool {
+// extractBaseSemver extracts the base semver from a version string.
+// Handles formats like:
+//   - "0.4.0" -> "0.4.0"
+//   - "v0.4.0" -> "0.4.0"
+//   - "0.4.0-5-gabcdef" -> "0.4.0" (git describe format)
+//   - "0.4.0-dev" -> "0.4.0"
+//   - "abc1234" -> "" (no semver)
+//   - "dev" -> "" (no semver)
+func extractBaseSemver(v string) string {
 	v = strings.TrimPrefix(v, "v")
+	if len(v) == 0 || v[0] < '0' || v[0] > '9' {
+		return ""
+	}
 	if !strings.Contains(v, ".") {
-		return false
+		return ""
 	}
-	if len(v) == 0 {
-		return false
+	// Extract up to the first hyphen (for git describe or prerelease tags)
+	if idx := strings.Index(v, "-"); idx > 0 {
+		v = v[:idx]
 	}
-	return v[0] >= '0' && v[0] <= '9'
+	return v
 }
 
 // isNewer returns true if v1 is newer than v2
 // Assumes semver format: major.minor.patch
-// Non-semver versions (like "dev" or git hashes) are always considered older
+// Handles git describe format (v0.4.0-5-gabcdef) by extracting base version.
+// Returns false for pure dev builds (hashes like "9c2baf2") since we can't
+// determine their relationship to releases - skip update notifications for these.
 func isNewer(v1, v2 string) bool {
-	v1 = strings.TrimPrefix(v1, "v")
-	v2 = strings.TrimPrefix(v2, "v")
+	base1 := extractBaseSemver(v1)
+	base2 := extractBaseSemver(v2)
 
-	// If current version is not semver (dev build), any semver release is newer
-	if !isSemver(v2) && isSemver(v1) {
-		return true
+	// If current version has no semver base (pure hash dev build), skip update notification
+	// We can't determine if they're ahead or behind releases
+	if base2 == "" {
+		return false
 	}
-	// If release version is not semver, something is wrong - not newer
-	if !isSemver(v1) {
+	// If release version has no semver base, something is wrong - not newer
+	if base1 == "" {
 		return false
 	}
 
-	parts1 := strings.Split(v1, ".")
-	parts2 := strings.Split(v2, ".")
+	parts1 := strings.Split(base1, ".")
+	parts2 := strings.Split(base2, ".")
 
 	for i := 0; i < 3; i++ {
 		var n1, n2 int
