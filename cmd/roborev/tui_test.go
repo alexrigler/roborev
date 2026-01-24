@@ -546,14 +546,14 @@ func TestTUIAddressReviewInBackgroundAddressError(t *testing.T) {
 
 func TestTUIHTTPTimeout(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Delay longer than client timeout
-		time.Sleep(200 * time.Millisecond)
+		// Delay much longer than client timeout to avoid flaky timing on fast machines
+		time.Sleep(500 * time.Millisecond)
 		json.NewEncoder(w).Encode(map[string]interface{}{"jobs": []storage.ReviewJob{}})
 	}))
 	defer ts.Close()
 
 	m := newTuiModel(ts.URL)
-	// Override with short timeout for test
+	// Override with short timeout for test (10x shorter than server delay)
 	m.client.Timeout = 50 * time.Millisecond
 
 	cmd := m.fetchJobs()
