@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/roborev-dev/roborev/internal/agent"
 	"github.com/roborev-dev/roborev/internal/storage"
 )
 
@@ -172,7 +175,7 @@ func TestAddJobResponse(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	err := addJobResponse(ts.URL, 123, "Fix applied")
+	err := addJobResponse(ts.URL, 123, "roborev-fix", "Fix applied")
 	if err != nil {
 		t.Fatalf("addJobResponse: %v", err)
 	}
@@ -262,11 +265,6 @@ func TestFixCmdFlagValidation(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "no args and no --unaddressed",
-			args:    []string{},
-			wantErr: "requires at least 1 arg",
-		},
-		{
 			name:    "--branch without --unaddressed",
 			args:    []string{"--branch", "main"},
 			wantErr: "--branch requires --unaddressed",
@@ -310,6 +308,34 @@ func TestFixCmdFlagValidation(t *testing.T) {
 	}
 }
 
+func TestFixNoArgsDefaultsToUnaddressed(t *testing.T) {
+	// Running fix with no args should not produce a validation error —
+	// it should enter the unaddressed path (which will fail at daemon
+	// connection, not at argument validation).
+	//
+	// Use a mock daemon so ensureDaemon doesn't try to spawn a real
+	// daemon subprocess (which hangs on CI).
+	_, cleanup := setupMockDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Return empty for all queries — we only care about argument routing
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jobs":     []interface{}{},
+			"has_more": false,
+		})
+	}))
+	defer cleanup()
+
+	cmd := fixCmd()
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	cmd.SetArgs([]string{})
+	err := cmd.Execute()
+	// Should NOT be a validation/args error; any other error (e.g. daemon
+	// not running) is acceptable.
+	if err != nil && strings.Contains(err.Error(), "requires at least") {
+		t.Errorf("no-args should default to --unaddressed, got validation error: %v", err)
+	}
+}
+
 func TestRunFixUnaddressed(t *testing.T) {
 	tmpDir := initTestGitRepo(t)
 
@@ -348,18 +374,26 @@ func TestRunFixUnaddressed(t *testing.T) {
 
 	t.Run("finds and processes unaddressed jobs", func(t *testing.T) {
 		var reviewCalls, addressCalls atomic.Int32
+		var unaddressedCalls atomic.Int32
 		_, cleanup := setupMockDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/api/jobs":
 				q := r.URL.Query()
 				if q.Get("addressed") == "false" && q.Get("limit") == "0" {
-					json.NewEncoder(w).Encode(map[string]interface{}{
-						"jobs": []storage.ReviewJob{
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
-							{ID: 20, Status: storage.JobStatusDone, Agent: "test"},
-						},
-						"has_more": false,
-					})
+					if unaddressedCalls.Add(1) == 1 {
+						json.NewEncoder(w).Encode(map[string]interface{}{
+							"jobs": []storage.ReviewJob{
+								{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
+								{ID: 20, Status: storage.JobStatusDone, Agent: "test"},
+							},
+							"has_more": false,
+						})
+					} else {
+						json.NewEncoder(w).Encode(map[string]interface{}{
+							"jobs":     []storage.ReviewJob{},
+							"has_more": false,
+						})
+					}
 				} else {
 					json.NewEncoder(w).Encode(map[string]interface{}{
 						"jobs": []storage.ReviewJob{
@@ -462,21 +496,29 @@ func TestRunFixUnaddressed(t *testing.T) {
 func TestRunFixUnaddressedOrdering(t *testing.T) {
 	tmpDir := initTestGitRepo(t)
 
-	makeHandler := func() http.Handler {
+	makeHandler := func() (http.Handler, *atomic.Int32) {
+		var unaddressedCalls atomic.Int32
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			switch r.URL.Path {
 			case "/api/jobs":
 				q := r.URL.Query()
 				if q.Get("addressed") == "false" {
-					// Return newest first (as the API does)
-					json.NewEncoder(w).Encode(map[string]interface{}{
-						"jobs": []storage.ReviewJob{
-							{ID: 30, Status: storage.JobStatusDone, Agent: "test"},
-							{ID: 20, Status: storage.JobStatusDone, Agent: "test"},
-							{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
-						},
-						"has_more": false,
-					})
+					if unaddressedCalls.Add(1) == 1 {
+						// Return newest first (as the API does)
+						json.NewEncoder(w).Encode(map[string]interface{}{
+							"jobs": []storage.ReviewJob{
+								{ID: 30, Status: storage.JobStatusDone, Agent: "test"},
+								{ID: 20, Status: storage.JobStatusDone, Agent: "test"},
+								{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
+							},
+							"has_more": false,
+						})
+					} else {
+						json.NewEncoder(w).Encode(map[string]interface{}{
+							"jobs":     []storage.ReviewJob{},
+							"has_more": false,
+						})
+					}
 				} else {
 					json.NewEncoder(w).Encode(map[string]interface{}{
 						"jobs": []storage.ReviewJob{
@@ -494,11 +536,12 @@ func TestRunFixUnaddressedOrdering(t *testing.T) {
 			case "/api/enqueue":
 				w.WriteHeader(http.StatusOK)
 			}
-		})
+		}), &unaddressedCalls
 	}
 
 	t.Run("oldest first by default", func(t *testing.T) {
-		_, cleanup := setupMockDaemon(t, makeHandler())
+		h, _ := makeHandler()
+		_, cleanup := setupMockDaemon(t, h)
 		defer cleanup()
 
 		var output bytes.Buffer
@@ -519,7 +562,8 @@ func TestRunFixUnaddressedOrdering(t *testing.T) {
 	})
 
 	t.Run("newest first with flag", func(t *testing.T) {
-		_, cleanup := setupMockDaemon(t, makeHandler())
+		h, _ := makeHandler()
+		_, cleanup := setupMockDaemon(t, h)
 		defer cleanup()
 
 		var output bytes.Buffer
@@ -538,6 +582,87 @@ func TestRunFixUnaddressedOrdering(t *testing.T) {
 			t.Errorf("expected newest-first order [30 20 10], got %q", output.String())
 		}
 	})
+}
+
+func TestRunFixUnaddressedRequery(t *testing.T) {
+	tmpDir := initTestGitRepo(t)
+
+	var queryCount atomic.Int32
+	_, cleanup := setupMockDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/jobs":
+			q := r.URL.Query()
+			if q.Get("addressed") == "false" && q.Get("limit") == "0" {
+				n := queryCount.Add(1)
+				switch n {
+				case 1:
+					// First query: return batch 1
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"jobs": []storage.ReviewJob{
+							{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
+						},
+						"has_more": false,
+					})
+				case 2:
+					// Second query: new job appeared
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"jobs": []storage.ReviewJob{
+							{ID: 20, Status: storage.JobStatusDone, Agent: "test"},
+							{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
+						},
+						"has_more": false,
+					})
+				default:
+					// Third query: no new jobs
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"jobs":     []storage.ReviewJob{},
+						"has_more": false,
+					})
+				}
+			} else {
+				// Individual job fetch
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"jobs": []storage.ReviewJob{
+						{ID: 10, Status: storage.JobStatusDone, Agent: "test"},
+					},
+					"has_more": false,
+				})
+			}
+		case "/api/review":
+			json.NewEncoder(w).Encode(storage.Review{Output: "findings"})
+		case "/api/comment":
+			w.WriteHeader(http.StatusCreated)
+		case "/api/review/address":
+			w.WriteHeader(http.StatusOK)
+		case "/api/enqueue":
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer cleanup()
+
+	var output bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&output)
+
+	oldWd, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(oldWd)
+
+	err := runFixUnaddressed(cmd, "", false, fixOptions{agentName: "test", reasoning: "fast"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := output.String()
+	if !strings.Contains(out, "Found 1 unaddressed job(s)") {
+		t.Errorf("expected first batch message, got %q", out)
+	}
+	if !strings.Contains(out, "Found 1 new unaddressed job(s)") {
+		t.Errorf("expected second batch message, got %q", out)
+	}
+	if int(queryCount.Load()) != 3 {
+		t.Errorf("expected 3 queries, got %d", queryCount.Load())
+	}
 }
 
 func initTestGitRepo(t *testing.T) string {
@@ -563,6 +688,114 @@ func initTestGitRepo(t *testing.T) string {
 	cmd.Dir = tmpDir
 	cmd.Run()
 	return tmpDir
+}
+
+// fakeAgent implements agent.Agent for testing fixJobDirect.
+type fakeAgent struct {
+	name     string
+	reviewFn func(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error)
+}
+
+func (a *fakeAgent) Name() string { return a.name }
+func (a *fakeAgent) Review(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
+	return a.reviewFn(ctx, repoPath, commitSHA, prompt, output)
+}
+func (a *fakeAgent) WithReasoning(level agent.ReasoningLevel) agent.Agent { return a }
+func (a *fakeAgent) WithAgentic(agentic bool) agent.Agent                  { return a }
+func (a *fakeAgent) WithModel(model string) agent.Agent                    { return a }
+
+func TestFixJobDirectUnbornHead(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	t.Run("agent creates first commit", func(t *testing.T) {
+		// Create a fresh git repo with no commits (unborn HEAD)
+		dir := t.TempDir()
+		cmd := exec.Command("git", "init")
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init: %v\n%s", err, out)
+		}
+		for _, args := range [][]string{
+			{"config", "user.email", "test@test.com"},
+			{"config", "user.name", "Test"},
+		} {
+			c := exec.Command("git", args...)
+			c.Dir = dir
+			if err := c.Run(); err != nil {
+				t.Fatalf("git %v: %v", args, err)
+			}
+		}
+
+		ag := &fakeAgent{
+			name: "test",
+			reviewFn: func(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
+				// Simulate agent creating the first commit
+				if err := os.WriteFile(filepath.Join(repoPath, "fix.txt"), []byte("fixed"), 0644); err != nil {
+					return "", fmt.Errorf("write file: %w", err)
+				}
+				c := exec.Command("git", "add", ".")
+				c.Dir = repoPath
+				if err := c.Run(); err != nil {
+					return "", fmt.Errorf("git add: %w", err)
+				}
+				c = exec.Command("git", "commit", "-m", "first commit")
+				c.Dir = repoPath
+				if err := c.Run(); err != nil {
+					return "", fmt.Errorf("git commit: %w", err)
+				}
+				return "applied fix", nil
+			},
+		}
+
+		result, err := fixJobDirect(context.Background(), fixJobParams{
+			RepoRoot: dir,
+			Agent:    ag,
+		}, "fix things")
+		if err != nil {
+			t.Fatalf("fixJobDirect: %v", err)
+		}
+		if !result.CommitCreated {
+			t.Error("expected CommitCreated=true")
+		}
+		if result.NoChanges {
+			t.Error("expected NoChanges=false")
+		}
+		if result.NewCommitSHA == "" {
+			t.Error("expected NewCommitSHA to be set")
+		}
+	})
+
+	t.Run("agent makes no changes on unborn head", func(t *testing.T) {
+		dir := t.TempDir()
+		cmd := exec.Command("git", "init")
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git init: %v\n%s", err, out)
+		}
+
+		ag := &fakeAgent{
+			name: "test",
+			reviewFn: func(ctx context.Context, repoPath, commitSHA, prompt string, output io.Writer) (string, error) {
+				return "nothing to do", nil
+			},
+		}
+
+		result, err := fixJobDirect(context.Background(), fixJobParams{
+			RepoRoot: dir,
+			Agent:    ag,
+		}, "fix things")
+		if err != nil {
+			t.Fatalf("fixJobDirect: %v", err)
+		}
+		if result.CommitCreated {
+			t.Error("expected CommitCreated=false")
+		}
+		if !result.NoChanges {
+			t.Error("expected NoChanges=true")
+		}
+	})
 }
 
 func TestEnqueueIfNeededSkipsWhenJobExists(t *testing.T) {

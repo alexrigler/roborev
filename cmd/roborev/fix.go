@@ -33,27 +33,27 @@ func fixCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "fix [job_id...]",
-		Short: "Apply fixes for an analysis job",
-		Long: `Apply fixes for one or more analysis jobs.
+		Short: "One-shot fix for review findings",
+		Long: `Run an agent to address findings from one or more completed reviews.
 
-This command fetches the analysis output from a completed job and runs
-an agentic agent locally to apply the suggested fixes. When complete,
-a response is added to the job and it is marked as addressed.
+This is a single-pass fix: the agent applies changes and commits, but
+does not re-review or iterate. Use 'roborev refine' for an automated
+loop that re-reviews fixes and retries until reviews pass.
 
-The fix runs synchronously in your terminal, streaming output as the
-agent works. This allows you to review the analysis results before
-deciding which jobs to fix.
+The agent runs synchronously in your terminal, streaming output as it
+works. The review output is printed first so you can see what needs
+fixing. When complete, the job is marked as addressed.
 
 Use --unaddressed to automatically discover and fix all unaddressed
 completed jobs for the current repo.
 
 Examples:
-  roborev fix 123                    # Fix a single job
-  roborev fix 123 124 125            # Fix multiple jobs
-  roborev fix --agent claude-code 123
-  roborev fix --unaddressed              # Fix unaddressed jobs on current branch
-  roborev fix --unaddressed --branch main  # Only unaddressed jobs on main
-  roborev fix --unaddressed --all-branches # Fix unaddressed jobs across all branches
+  roborev fix 123                        # Fix a single job
+  roborev fix 123 124 125                # Fix multiple jobs sequentially
+  roborev fix --agent claude-code 123    # Use a specific agent
+  roborev fix --unaddressed              # Fix all unaddressed on current branch
+  roborev fix --unaddressed --branch main
+  roborev fix --unaddressed --all-branches
 `,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -72,10 +72,6 @@ Examples:
 			if unaddressed && len(args) > 0 {
 				return fmt.Errorf("--unaddressed cannot be used with positional job IDs")
 			}
-			if !unaddressed && len(args) == 0 {
-				return fmt.Errorf("requires at least 1 arg(s), only received 0 (use --unaddressed to fix all unaddressed jobs)")
-			}
-
 			opts := fixOptions{
 				agentName: agentName,
 				model:     model,
@@ -83,7 +79,7 @@ Examples:
 				quiet:     quiet,
 			}
 
-			if unaddressed {
+			if unaddressed || len(args) == 0 {
 				// Default to current branch unless --branch or --all-branches is set
 				effectiveBranch := branch
 				if !allBranches && effectiveBranch == "" {
@@ -133,7 +129,126 @@ type fixOptions struct {
 	quiet     bool
 }
 
+// fixJobParams configures a fixJobDirect operation.
+type fixJobParams struct {
+	RepoRoot string
+	Agent    agent.Agent
+	Output   io.Writer // agent streaming output (nil = discard)
+}
+
+// fixJobResult contains the outcome of a fix operation.
+type fixJobResult struct {
+	CommitCreated bool
+	NewCommitSHA  string
+	NoChanges     bool
+	AgentOutput   string
+}
+
+// detectNewCommit checks whether HEAD has moved past headBefore.
+func detectNewCommit(repoRoot, headBefore string) (string, bool) {
+	head, err := git.ResolveSHA(repoRoot, "HEAD")
+	if err != nil {
+		return "", false
+	}
+	if head != headBefore {
+		return head, true
+	}
+	return "", false
+}
+
+// fixJobDirect runs the agent directly on the repo and detects commits.
+// If the agent leaves uncommitted changes, it retries with a commit prompt.
+func fixJobDirect(ctx context.Context, params fixJobParams, prompt string) (*fixJobResult, error) {
+	out := params.Output
+	if out == nil {
+		out = io.Discard
+	}
+
+	headBefore, err := git.ResolveSHA(params.RepoRoot, "HEAD")
+	if err != nil {
+		// Only proceed if this is specifically an unborn HEAD (empty repo).
+		// Other errors (corrupt repo, permissions, non-git dir) should surface.
+		if !git.IsUnbornHead(params.RepoRoot) {
+			return nil, fmt.Errorf("resolve HEAD: %w", err)
+		}
+		// Unborn HEAD (empty repo) - run agent and check outcome
+		agentOutput, agentErr := params.Agent.Review(ctx, params.RepoRoot, "HEAD", prompt, out)
+		if agentErr != nil {
+			return nil, fmt.Errorf("fix agent failed: %w", agentErr)
+		}
+		// Check if the agent created the first commit
+		if headAfter, resolveErr := git.ResolveSHA(params.RepoRoot, "HEAD"); resolveErr == nil {
+			return &fixJobResult{CommitCreated: true, NewCommitSHA: headAfter, AgentOutput: agentOutput}, nil
+		}
+		// Still no commit - check working tree
+		hasChanges, hcErr := git.HasUncommittedChanges(params.RepoRoot)
+		if hcErr != nil {
+			return nil, fmt.Errorf("failed to check working tree state: %w", hcErr)
+		}
+		return &fixJobResult{NoChanges: !hasChanges, AgentOutput: agentOutput}, nil
+	}
+
+	agentOutput, agentErr := params.Agent.Review(ctx, params.RepoRoot, "HEAD", prompt, out)
+	if agentErr != nil {
+		return nil, fmt.Errorf("fix agent failed: %w", agentErr)
+	}
+
+	if sha, ok := detectNewCommit(params.RepoRoot, headBefore); ok {
+		return &fixJobResult{CommitCreated: true, NewCommitSHA: sha, AgentOutput: agentOutput}, nil
+	}
+
+	// No commit - retry if there are uncommitted changes
+	hasChanges, err := git.HasUncommittedChanges(params.RepoRoot)
+	if err != nil || !hasChanges {
+		return &fixJobResult{NoChanges: (err == nil && !hasChanges), AgentOutput: agentOutput}, nil
+	}
+
+	fmt.Fprint(out, "\nNo commit was created. Re-running agent with commit instructions...\n\n")
+	if _, retryErr := params.Agent.Review(ctx, params.RepoRoot, "HEAD", buildGenericCommitPrompt(), out); retryErr != nil {
+		fmt.Fprintf(out, "Warning: commit agent failed: %v\n", retryErr)
+	}
+	if sha, ok := detectNewCommit(params.RepoRoot, headBefore); ok {
+		return &fixJobResult{CommitCreated: true, NewCommitSHA: sha, AgentOutput: agentOutput}, nil
+	}
+
+	// Still no commit - report whether changes remain
+	hasChanges, _ = git.HasUncommittedChanges(params.RepoRoot)
+	return &fixJobResult{NoChanges: !hasChanges, AgentOutput: agentOutput}, nil
+}
+
+// resolveFixAgent resolves and configures the agent for fix operations.
+func resolveFixAgent(repoPath string, opts fixOptions) (agent.Agent, error) {
+	cfg, err := config.LoadGlobal()
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+
+	reasoning, err := config.ResolveFixReasoning(opts.reasoning, repoPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve fix reasoning: %w", err)
+	}
+
+	agentName := config.ResolveAgentForWorkflow(opts.agentName, repoPath, cfg, "fix", reasoning)
+	modelStr := config.ResolveModelForWorkflow(opts.model, repoPath, cfg, "fix", reasoning)
+
+	a, err := agent.GetAvailable(agentName)
+	if err != nil {
+		return nil, fmt.Errorf("get agent: %w", err)
+	}
+
+	reasoningLevel := agent.ParseReasoningLevel(reasoning)
+	a = a.WithAgentic(true).WithReasoning(reasoningLevel)
+	if modelStr != "" {
+		a = a.WithModel(modelStr)
+	}
+	return a, nil
+}
+
 func runFix(cmd *cobra.Command, jobIDs []int64, opts fixOptions) error {
+	return runFixWithSeen(cmd, jobIDs, opts, nil)
+}
+
+func runFixWithSeen(cmd *cobra.Command, jobIDs []int64, opts fixOptions, seen map[int64]bool) error {
 	// Ensure daemon is running
 	if err := ensureDaemon(); err != nil {
 		return err
@@ -156,14 +271,38 @@ func runFix(cmd *cobra.Command, jobIDs []int64, opts fixOptions) error {
 			cmd.Printf("\n=== Fixing job %d (%d/%d) ===\n", jobID, i+1, len(jobIDs))
 		}
 
-		if err := fixSingleJob(cmd, repoRoot, jobID, opts); err != nil {
-			if len(jobIDs) == 1 {
-				return err
+		err := fixSingleJob(cmd, repoRoot, jobID, opts)
+		if err != nil {
+			if isConnectionError(err) {
+				if !opts.quiet {
+					cmd.Printf("Daemon connection lost, attempting recovery...\n")
+				}
+				if recoverErr := ensureDaemon(); recoverErr != nil {
+					return fmt.Errorf("daemon connection lost and recovery failed: %w", recoverErr)
+				}
+				// Retry this job once after recovery
+				err = fixSingleJob(cmd, repoRoot, jobID, opts)
+				if err != nil {
+					if isConnectionError(err) {
+						return fmt.Errorf("daemon connection lost after recovery: %w", err)
+					}
+					// Non-connection error on retry: fall through to normal error handling
+				}
 			}
-			// Multiple jobs: log error and continue
-			if !opts.quiet {
-				cmd.Printf("Error fixing job %d: %v\n", jobID, err)
+			if err != nil {
+				if len(jobIDs) == 1 {
+					return err
+				}
+				if !opts.quiet {
+					cmd.Printf("Error fixing job %d: %v\n", jobID, err)
+				}
 			}
+		}
+		// Mark as seen so the re-query loop doesn't retry this job.
+		// Connection errors bail early (fatal return above), so only
+		// successfully attempted jobs reach here.
+		if seen != nil {
+			seen[jobID] = true
 		}
 	}
 
@@ -186,7 +325,51 @@ func runFixUnaddressed(cmd *cobra.Command, branch string, newestFirst bool, opts
 		repoRoot = root
 	}
 
-	// Query for unaddressed done jobs in this repo
+	seen := make(map[int64]bool)
+
+	for {
+		jobIDs, err := queryUnaddressedJobs(repoRoot, branch)
+		if err != nil {
+			return err
+		}
+
+		// Filter out jobs we've already processed
+		var newIDs []int64
+		for _, id := range jobIDs {
+			if !seen[id] {
+				newIDs = append(newIDs, id)
+			}
+		}
+
+		if len(newIDs) == 0 {
+			if len(seen) == 0 && !opts.quiet {
+				cmd.Println("No unaddressed jobs found.")
+			}
+			return nil
+		}
+
+		// API returns newest first; reverse to process oldest first by default
+		if !newestFirst {
+			for i, j := 0, len(newIDs)-1; i < j; i, j = i+1, j-1 {
+				newIDs[i], newIDs[j] = newIDs[j], newIDs[i]
+			}
+		}
+
+		if !opts.quiet {
+			if len(seen) > 0 {
+				cmd.Printf("\nFound %d new unaddressed job(s): %v\n", len(newIDs), newIDs)
+			} else {
+				cmd.Printf("Found %d unaddressed job(s): %v\n", len(newIDs), newIDs)
+			}
+		}
+
+		if err := runFixWithSeen(cmd, newIDs, opts, seen); err != nil {
+			return err
+		}
+	}
+}
+
+func queryUnaddressedJobs(repoRoot, branch string) ([]int64, error) {
 	queryURL := fmt.Sprintf("%s/api/jobs?status=done&repo=%s&addressed=false&limit=0",
 		serverAddr, url.QueryEscape(repoRoot))
 	if branch != "" {
@@ -195,46 +378,27 @@ func runFixUnaddressed(cmd *cobra.Command, branch string, newestFirst bool, opts
 
 	resp, err := http.Get(queryURL)
 	if err != nil {
-		return fmt.Errorf("query jobs: %w", err)
+		return nil, fmt.Errorf("query jobs: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("server error (%d): %s", resp.StatusCode, body)
+		return nil, fmt.Errorf("server error (%d): %s", resp.StatusCode, body)
 	}
 
 	var jobsResp struct {
 		Jobs []storage.ReviewJob `json:"jobs"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&jobsResp); err != nil {
-		return fmt.Errorf("decode response: %w", err)
-	}
-
-	if len(jobsResp.Jobs) == 0 {
-		if !opts.quiet {
-			cmd.Println("No unaddressed jobs found.")
-		}
-		return nil
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
 	var jobIDs []int64
 	for _, j := range jobsResp.Jobs {
 		jobIDs = append(jobIDs, j.ID)
 	}
-
-	// API returns newest first; reverse to process oldest first by default
-	if !newestFirst {
-		for i, j := 0, len(jobIDs)-1; i < j; i, j = i+1, j-1 {
-			jobIDs[i], jobIDs[j] = jobIDs[j], jobIDs[i]
-		}
-	}
-
-	if !opts.quiet {
-		cmd.Printf("Found %d unaddressed job(s): %v\n", len(jobIDs), jobIDs)
-	}
-
-	return runFix(cmd, jobIDs, opts)
+	return jobIDs, nil
 }
 
 func fixSingleJob(cmd *cobra.Command, repoRoot string, jobID int64, opts fixOptions) error {
@@ -249,7 +413,6 @@ func fixSingleJob(cmd *cobra.Command, repoRoot string, jobID int64, opts fixOpti
 		return fmt.Errorf("fetch job: %w", err)
 	}
 
-	// Check if job is complete
 	if job.Status != storage.JobStatusDone {
 		return fmt.Errorf("job %d is not complete (status: %s)", jobID, job.Status)
 	}
@@ -268,90 +431,70 @@ func fixSingleJob(cmd *cobra.Command, repoRoot string, jobID int64, opts fixOpti
 		cmd.Println()
 	}
 
-	// Build fix prompt
-	fixPrompt := buildGenericFixPrompt(review.Output)
+	// Resolve agent
+	fixAgent, err := resolveFixAgent(repoRoot, opts)
+	if err != nil {
+		return err
+	}
 
 	if !opts.quiet {
-		cmd.Printf("Running fix agent to apply changes...\n\n")
+		cmd.Printf("Running fix agent (%s) to apply changes...\n\n", fixAgent.Name())
 	}
 
-	// Get HEAD before running fix agent
-	headBefore, headErr := git.ResolveSHA(repoRoot, "HEAD")
-	canVerifyCommits := headErr == nil
-
-	// Run fix agent
-	if err := runFixAgentWithOpts(cmd, repoRoot, opts, fixPrompt); err != nil {
-		return fmt.Errorf("fix agent failed: %w", err)
+	// Set up output
+	var out io.Writer
+	var fmtr *streamFormatter
+	if opts.quiet {
+		out = io.Discard
+	} else {
+		fmtr = newStreamFormatter(cmd.OutOrStdout(), writerIsTerminal(cmd.OutOrStdout()))
+		out = fmtr
 	}
 
-	// Check if commit was created
-	var commitCreated bool
-	if canVerifyCommits {
-		headAfter, err := git.ResolveSHA(repoRoot, "HEAD")
-		if err == nil && headBefore != headAfter {
-			commitCreated = true
-		}
+	result, err := fixJobDirect(ctx, fixJobParams{
+		RepoRoot: repoRoot,
+		Agent:    fixAgent,
+		Output:   out,
+	}, buildGenericFixPrompt(review.Output))
+	if fmtr != nil {
+		fmtr.Flush()
+	}
+	if err != nil {
+		return err
+	}
 
-		// If no commit, check for uncommitted changes and retry
-		if !commitCreated {
-			hasChanges, err := git.HasUncommittedChanges(repoRoot)
-			if err == nil && hasChanges {
-				if !opts.quiet {
-					cmd.Println("\nNo commit was created. Re-running agent with commit instructions...")
-					cmd.Println()
-				}
-
-				commitPrompt := buildGenericCommitPrompt()
-				if err := runFixAgentWithOpts(cmd, repoRoot, opts, commitPrompt); err != nil {
-					if !opts.quiet {
-						cmd.Printf("Warning: commit agent failed: %v\n", err)
-					}
-				}
-
-				// Check again
-				headFinal, err := git.ResolveSHA(repoRoot, "HEAD")
-				if err == nil && headFinal != headAfter {
-					commitCreated = true
-				}
-			}
-		}
+	if !opts.quiet {
+		fmt.Fprintln(cmd.OutOrStdout())
 	}
 
 	// Report commit status
 	if !opts.quiet {
-		if !canVerifyCommits {
-			// Couldn't verify commits
-		} else if commitCreated {
+		if result.CommitCreated {
 			cmd.Println("\nChanges committed successfully.")
+		} else if result.NoChanges {
+			cmd.Println("\nNo changes were made by the fix agent.")
 		} else {
 			hasChanges, err := git.HasUncommittedChanges(repoRoot)
 			if err == nil && hasChanges {
 				cmd.Println("\nWarning: Changes were made but not committed. Please review and commit manually.")
-			} else if err == nil {
-				cmd.Println("\nNo changes were made by the fix agent.")
 			}
 		}
 	}
 
-	// Ensure the fix commit gets a review enqueued
-	// (post-commit hooks may not fire reliably from agent subprocesses)
-	if commitCreated {
-		if head, err := git.ResolveSHA(repoRoot, "HEAD"); err == nil {
-			if err := enqueueIfNeeded(serverAddr, repoRoot, head); err != nil && !opts.quiet {
-				cmd.Printf("Warning: could not enqueue review for fix commit: %v\n", err)
-			}
+	// Enqueue review for fix commit
+	if result.CommitCreated {
+		if err := enqueueIfNeeded(serverAddr, repoRoot, result.NewCommitSHA); err != nil && !opts.quiet {
+			cmd.Printf("Warning: could not enqueue review for fix commit: %v\n", err)
 		}
 	}
 
-	// Add response to job and mark as addressed
+	// Add response and mark as addressed
 	responseText := "Fix applied via `roborev fix` command"
-	if commitCreated {
-		if head, err := git.ResolveSHA(repoRoot, "HEAD"); err == nil {
-			responseText = fmt.Sprintf("Fix applied via `roborev fix` command (commit: %s)", head[:7])
-		}
+	if result.CommitCreated {
+		responseText = fmt.Sprintf("Fix applied via `roborev fix` command (commit: %s)", shortSHA(result.NewCommitSHA))
 	}
 
-	if err := addJobResponse(serverAddr, jobID, responseText); err != nil {
+	if err := addJobResponse(serverAddr, jobID, "roborev-fix", responseText); err != nil {
 		if !opts.quiet {
 			cmd.Printf("Warning: could not add response to job: %v\n", err)
 		}
@@ -463,67 +606,11 @@ func buildGenericCommitPrompt() string {
 	return sb.String()
 }
 
-// runFixAgentWithOpts runs the fix agent with the given options
-func runFixAgentWithOpts(cmd *cobra.Command, repoPath string, opts fixOptions, prompt string) error {
-	// Load config
-	cfg, err := config.LoadGlobal()
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-
-	// Resolve agent
-	agentName := opts.agentName
-	if agentName == "" {
-		agentName = cfg.DefaultAgent
-	}
-
-	a, err := agent.GetAvailable(agentName)
-	if err != nil {
-		return fmt.Errorf("get agent: %w", err)
-	}
-
-	// Configure agent
-	reasoningLevel := agent.ParseReasoningLevel(opts.reasoning)
-	a = a.WithAgentic(true).WithReasoning(reasoningLevel)
-	if opts.model != "" {
-		a = a.WithModel(opts.model)
-	}
-
-	// Use stdout for streaming output, with stream formatting for TTY
-	var out io.Writer
-	var fmtr *streamFormatter
-	if opts.quiet {
-		out = io.Discard
-	} else {
-		fmtr = newStreamFormatter(cmd.OutOrStdout(), writerIsTerminal(cmd.OutOrStdout()))
-		out = fmtr
-	}
-
-	// Use command context
-	ctx := cmd.Context()
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	_, err = a.Review(ctx, repoPath, "fix", prompt, out)
-	if fmtr != nil {
-		fmtr.Flush()
-	}
-	if err != nil {
-		return err
-	}
-
-	if !opts.quiet {
-		fmt.Fprintln(cmd.OutOrStdout())
-	}
-	return nil
-}
-
 // addJobResponse adds a response/comment to a job
-func addJobResponse(serverAddr string, jobID int64, response string) error {
+func addJobResponse(serverAddr string, jobID int64, commenter, response string) error {
 	reqBody, _ := json.Marshal(map[string]interface{}{
 		"job_id":    jobID,
-		"commenter": "roborev-fix",
+		"commenter": commenter,
 		"comment":   response,
 	})
 

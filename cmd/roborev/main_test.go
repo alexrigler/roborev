@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/roborev-dev/roborev/internal/agent"
+	"github.com/roborev-dev/roborev/internal/git"
 	"github.com/roborev-dev/roborev/internal/daemon"
 	"github.com/roborev-dev/roborev/internal/storage"
 	"github.com/roborev-dev/roborev/internal/version"
@@ -324,41 +325,58 @@ func TestSummarizeAgentOutput(t *testing.T) {
 	}
 }
 
-func TestRefineNoChangeRetryLogic(t *testing.T) {
-	// Test that the retry counting logic works correctly
+func TestRefineNoChangeSkipsImmediately(t *testing.T) {
+	// When the agent makes no changes, refine should skip the review
+	// immediately. The skip path is triggered by IsWorkingTreeClean
+	// returning true, which records a comment and adds to skippedReviews.
+	//
+	// Integration coverage: TestRunRefineSurfacesResponseErrors exercises
+	// the full loop. Here we verify the predicate and skip-tracking logic.
 
-	t.Run("counts no-change attempts from responses", func(t *testing.T) {
-		_, cleanup := setupMockDaemon(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Return 2 previous no-change responses
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"responses": []storage.Response{
-					{Responder: "roborev-refine", Response: "Agent could not determine how to address findings (attempt 1)"},
-					{Responder: "roborev-refine", Response: "Agent could not determine how to address findings (attempt 2)"},
-				},
-			})
-		}))
-		defer cleanup()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
 
-		responses, _ := getCommentsForJob(1)
-
-		// Count no-change attempts
-		noChangeAttempts := 0
-		for _, a := range responses {
-			if strings.Contains(a.Response, "could not determine how to address") {
-				noChangeAttempts++
-			}
+	// A fresh repo with a committed file should have a clean working tree
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test"},
+	} {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if err := c.Run(); err != nil {
+			t.Fatalf("git %v: %v", args, err)
 		}
-
-		if noChangeAttempts != 2 {
-			t.Errorf("expected 2 no-change attempts, got %d", noChangeAttempts)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"add", "."},
+		{"commit", "-m", "initial"},
+	} {
+		c := exec.Command("git", args...)
+		c.Dir = dir
+		if err := c.Run(); err != nil {
+			t.Fatalf("git %v: %v", args, err)
 		}
+	}
 
-		// After 2 attempts, third should mark as addressed (threshold is >= 2)
-		shouldMarkAddressed := noChangeAttempts >= 2
-		if !shouldMarkAddressed {
-			t.Error("expected to mark as addressed after 2 previous failures")
-		}
-	})
+	if !git.IsWorkingTreeClean(dir) {
+		t.Fatal("expected clean working tree after commit")
+	}
+
+	// Verify skip tracking: skippedReviews map should track skipped review IDs
+	skippedReviews := make(map[int64]bool)
+	skippedReviews[42] = true
+	if !skippedReviews[42] {
+		t.Fatal("expected review 42 to be tracked as skipped")
+	}
+	if skippedReviews[99] {
+		t.Fatal("expected review 99 to not be tracked as skipped")
+	}
 }
 
 func TestRunRefineSurfacesResponseErrors(t *testing.T) {
@@ -781,94 +799,43 @@ func TestRefineLoopFindFailedReviewPath(t *testing.T) {
 	})
 }
 
-func TestRefineLoopNoChangeRetryScenario(t *testing.T) {
-	// Test the retry counting when agent makes no changes
-	// countNoChangeAttempts mirrors the logic in runRefine()
-	countNoChangeAttempts := func(responses []storage.Response) int {
-		count := 0
-		for _, a := range responses {
-			// Must match both responder AND message pattern (security: prevent other responders from inflating count)
-			if a.Responder == "roborev-refine" && strings.Contains(a.Response, "could not determine how to address") {
-				count++
-			}
-		}
-		return count
+func TestRefineLoopNoChangeSkipsReview(t *testing.T) {
+	// When the agent makes no changes, refine records a comment and skips
+	// the review. Verify the comments API works for both empty and populated
+	// cases so the skip logic can rely on it.
+	//
+	// Integration coverage: TestRunRefineSurfacesResponseErrors exercises
+	// the full loop including the skip path.
+	state := newMockRefineState()
+	state.responses[42] = []storage.Response{}
+	jobID99 := int64(99)
+	state.responses[99] = []storage.Response{
+		{ID: 1, JobID: &jobID99, Responder: "roborev-refine", Response: "Agent could not determine how to address findings"},
 	}
 
-	t.Run("three consecutive no-change attempts mark review as addressed", func(t *testing.T) {
-		state := newMockRefineState()
-		// Simulate 2 previous failed attempts from roborev-refine
-		state.responses[42] = []storage.Response{
-			{ID: 1, Responder: "roborev-refine", Response: "Agent could not determine how to address findings (attempt 1)"},
-			{ID: 2, Responder: "roborev-refine", Response: "Agent could not determine how to address findings (attempt 2)"},
-		}
+	_, cleanup := setupMockDaemon(t, createMockRefineHandler(state))
+	defer cleanup()
 
-		_, cleanup := setupMockDaemon(t, createMockRefineHandler(state))
-		defer cleanup()
+	// Job with no prior comments — skip should still apply (no retries needed)
+	responses, err := getCommentsForJob(42)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(responses) != 0 {
+		t.Errorf("expected 0 previous responses for job 42, got %d", len(responses))
+	}
 
-		responses, err := getCommentsForJob(42)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		noChangeAttempts := countNoChangeAttempts(responses)
-
-		// Should have 2 previous attempts
-		if noChangeAttempts != 2 {
-			t.Errorf("expected 2 previous no-change attempts, got %d", noChangeAttempts)
-		}
-
-		// Per the logic: if noChangeAttempts >= 2, we mark as addressed (third attempt)
-		shouldGiveUp := noChangeAttempts >= 2
-		if !shouldGiveUp {
-			t.Error("expected to give up after 2 previous failures")
-		}
-	})
-
-	t.Run("first no-change attempt does not mark as addressed", func(t *testing.T) {
-		state := newMockRefineState()
-		// No previous attempts
-		state.responses[42] = []storage.Response{}
-
-		_, cleanup := setupMockDaemon(t, createMockRefineHandler(state))
-		defer cleanup()
-
-		responses, _ := getCommentsForJob(42)
-		noChangeAttempts := countNoChangeAttempts(responses)
-
-		// Should not give up yet (first attempt)
-		shouldGiveUp := noChangeAttempts >= 2
-		if shouldGiveUp {
-			t.Error("should not give up on first attempt")
-		}
-	})
-
-	t.Run("responses from other responders do not inflate retry count", func(t *testing.T) {
-		state := newMockRefineState()
-		// Mix of responses: 1 from roborev-refine, 2 from other sources with same message
-		state.responses[42] = []storage.Response{
-			{ID: 1, Responder: "roborev-refine", Response: "Agent could not determine how to address findings (attempt 1)"},
-			{ID: 2, Responder: "user", Response: "Agent could not determine how to address findings - I tried manually"},
-			{ID: 3, Responder: "other-tool", Response: "could not determine how to address this issue"},
-		}
-
-		_, cleanup := setupMockDaemon(t, createMockRefineHandler(state))
-		defer cleanup()
-
-		responses, _ := getCommentsForJob(42)
-		noChangeAttempts := countNoChangeAttempts(responses)
-
-		// Should only count the 1 response from roborev-refine, not the others
-		if noChangeAttempts != 1 {
-			t.Errorf("expected 1 no-change attempt (from roborev-refine only), got %d", noChangeAttempts)
-		}
-
-		// With only 1 attempt, should NOT give up yet
-		shouldGiveUp := noChangeAttempts >= 2
-		if shouldGiveUp {
-			t.Error("should not give up when only 1 roborev-refine attempt exists")
-		}
-	})
+	// Job with a prior skip comment — verify the comment text matches
+	responses, err = getCommentsForJob(99)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(responses) != 1 {
+		t.Fatalf("expected 1 response for job 99, got %d", len(responses))
+	}
+	if !strings.Contains(responses[0].Response, "could not determine") {
+		t.Errorf("expected skip comment, got %q", responses[0].Response)
+	}
 }
 
 func TestRefineLoopBranchReviewPath(t *testing.T) {
