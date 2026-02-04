@@ -1004,12 +1004,15 @@ func addJobResponse(serverAddr string, jobID int64, commenter, response string) 
 func enqueueIfNeeded(serverAddr, repoPath, sha string) error {
 	// Check if a review job already exists for this commit (e.g., from the
 	// post-commit hook). If so, skip enqueuing to avoid duplicates.
-	// We check twice with a 1-second delay to give the post-commit hook
-	// time to fire before we enqueue ourselves.
-	if hasJobForSHA(serverAddr, sha) {
-		return nil
+	// The post-commit hook normally completes before control returns here,
+	// but under heavy load it may take longer. Poll with short intervals
+	// up to a max wait to avoid both unnecessary delays and duplicates.
+	for range 10 {
+		if hasJobForSHA(serverAddr, sha) {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
 	}
-	time.Sleep(2 * time.Second)
 	if hasJobForSHA(serverAddr, sha) {
 		return nil
 	}

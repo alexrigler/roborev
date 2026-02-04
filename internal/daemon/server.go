@@ -451,6 +451,16 @@ func (s *Server) handleEnqueue(w http.ResponseWriter, r *http.Request) {
 	// Resolve agent for review workflow at this reasoning level
 	agentName := config.ResolveAgentForWorkflow(req.Agent, repoRoot, s.configWatcher.Config(), "review", reasoning)
 
+	// Resolve to an installed agent: if the configured agent isn't available,
+	// fall back through the chain (codex -> claude-code -> gemini -> ...).
+	// Fail fast with 503 if nothing is installed at all.
+	if resolved, err := agent.GetAvailable(agentName); err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("no review agent available: %v", err))
+		return
+	} else {
+		agentName = resolved.Name()
+	}
+
 	// Resolve model for review workflow at this reasoning level
 	model := config.ResolveModelForWorkflow(req.Model, repoRoot, s.configWatcher.Config(), "review", reasoning)
 
