@@ -20,6 +20,7 @@ import (
 
 	"github.com/roborev-dev/roborev/internal/agent"
 	"github.com/roborev-dev/roborev/internal/config"
+	gitpkg "github.com/roborev-dev/roborev/internal/git"
 	"github.com/roborev-dev/roborev/internal/storage"
 	"github.com/roborev-dev/roborev/internal/testutil"
 )
@@ -3017,4 +3018,108 @@ func TestHandleEnqueueWorktreeGitDirIsolation(t *testing.T) {
 			t.Errorf("expected worktree commit B (%s), got %s", commitB, job.GitRef)
 		}
 	})
+}
+
+// TestHandleEnqueueRangeFromRootCommit verifies that a range review starting
+// from the root commit (which has no parent) succeeds by falling back to the
+// empty tree SHA.
+func TestHandleEnqueueRangeFromRootCommit(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitTestGitRepo(t, repoDir)
+
+	// Get the root commit SHA
+	rootSHA, err := gitpkg.ResolveSHA(repoDir, "HEAD")
+	if err != nil {
+		t.Fatalf("resolve root SHA: %v", err)
+	}
+
+	// Add a second commit so we have a range
+	testFile := filepath.Join(repoDir, "second.txt")
+	if err := os.WriteFile(testFile, []byte("second"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"git", "-C", repoDir, "add", "."},
+		{"git", "-C", repoDir, "commit", "-m", "second"},
+	} {
+		cmd := exec.Command(args[0], args[1:]...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v failed: %v\n%s", args, err, out)
+		}
+	}
+	endSHA, err := gitpkg.ResolveSHA(repoDir, "HEAD")
+	if err != nil {
+		t.Fatalf("resolve end SHA: %v", err)
+	}
+
+	server, _, _ := newTestServer(t)
+
+	// Send range starting from root commit's parent (rootSHA^..endSHA)
+	// This is what the CLI sends for "roborev review <root> <end>"
+	rangeRef := rootSHA + "^.." + endSHA
+	reqData := map[string]string{
+		"repo_path": repoDir,
+		"git_ref":   rangeRef,
+		"agent":     "test",
+	}
+	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", reqData)
+	w := httptest.NewRecorder()
+
+	server.handleEnqueue(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var job storage.ReviewJob
+	if err := json.NewDecoder(w.Body).Decode(&job); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	// The stored range should use the empty tree SHA as the start
+	expectedRef := gitpkg.EmptyTreeSHA + ".." + endSHA
+	if job.GitRef != expectedRef {
+		t.Errorf("expected git_ref %q, got %q", expectedRef, job.GitRef)
+	}
+}
+
+// TestHandleEnqueueRangeNonCommitObjectRejects verifies that the root-commit
+// fallback does not trigger for non-commit objects (e.g. blobs).
+func TestHandleEnqueueRangeNonCommitObjectRejects(t *testing.T) {
+	repoDir := t.TempDir()
+	testutil.InitTestGitRepo(t, repoDir)
+
+	endSHA, err := gitpkg.ResolveSHA(repoDir, "HEAD")
+	if err != nil {
+		t.Fatalf("resolve HEAD: %v", err)
+	}
+
+	// Get a blob SHA (the test.txt file created by InitTestGitRepo)
+	cmd := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD:test.txt")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("get blob SHA: %v", err)
+	}
+	blobSHA := strings.TrimSpace(string(out))
+
+	server, _, _ := newTestServer(t)
+
+	// A blob^ should not fall back to EmptyTreeSHA — it should return 400
+	rangeRef := blobSHA + "^.." + endSHA
+	reqData := map[string]string{
+		"repo_path": repoDir,
+		"git_ref":   rangeRef,
+		"agent":     "test",
+	}
+	req := testutil.MakeJSONRequest(t, http.MethodPost, "/api/enqueue", reqData)
+	w := httptest.NewRecorder()
+
+	server.handleEnqueue(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "invalid start commit") {
+		t.Errorf("expected 'invalid start commit' error, got: %s", w.Body.String())
+	}
 }
