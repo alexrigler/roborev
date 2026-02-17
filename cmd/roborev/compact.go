@@ -1,0 +1,639 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/roborev-dev/roborev/internal/config"
+	"github.com/roborev-dev/roborev/internal/daemon"
+	"github.com/roborev-dev/roborev/internal/git"
+	"github.com/roborev-dev/roborev/internal/storage"
+	"github.com/spf13/cobra"
+)
+
+func compactCmd() *cobra.Command {
+	var (
+		agentName   string
+		model       string
+		reasoning   string
+		quiet       bool
+		allBranches bool
+		branch      string
+		dryRun      bool
+		limit       int
+		wait        bool
+		timeout     time.Duration
+	)
+
+	cmd := &cobra.Command{
+		Use:   "compact",
+		Short: "Verify and consolidate unaddressed review findings",
+		Long: `Verify and consolidate unaddressed review findings.
+
+Discovers all unaddressed completed review jobs, sends them to an agent
+for verification against the current codebase, consolidates related findings,
+and creates a new consolidated review job.
+
+By default, compact runs in the background. Use --wait to block until complete.
+
+When consolidation finishes successfully, original jobs are automatically marked
+as addressed. Check progress with 'roborev status' or 'roborev tui'.
+
+This adds a quality layer between 'review' and 'fix' to reduce false positives
+and consolidate findings from multiple reviews.
+
+Note: This operation is not atomic. Avoid running multiple compact commands
+concurrently on the same branch to prevent inconsistent state.
+
+Examples:
+  roborev compact                              # Enqueue consolidation (background)
+  roborev compact --wait                       # Wait for completion
+  roborev compact --branch main                # Compact jobs on main branch
+  roborev compact --all-branches               # Compact jobs across all branches
+  roborev compact --dry-run                    # Show what would be done
+  roborev compact --limit 10                   # Process at most 10 jobs
+  roborev compact --agent claude-code          # Use specific agent for verification
+  roborev compact --reasoning thorough         # Use thorough reasoning level
+`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Validate flags
+			if branch != "" && allBranches {
+				return fmt.Errorf("--branch and --all-branches are mutually exclusive")
+			}
+
+			return runCompact(cmd, compactOptions{
+				agentName:   agentName,
+				model:       model,
+				reasoning:   reasoning,
+				quiet:       quiet,
+				allBranches: allBranches,
+				branch:      branch,
+				dryRun:      dryRun,
+				limit:       limit,
+				wait:        wait,
+				timeout:     timeout,
+			})
+		},
+	}
+
+	cmd.Flags().StringVar(&agentName, "agent", "", "agent to use for verification (defaults to fix agent from config)")
+	cmd.Flags().StringVar(&model, "model", "", "model to use")
+	cmd.Flags().StringVar(&reasoning, "reasoning", "", "reasoning level (fast/standard/thorough)")
+	cmd.Flags().BoolVarP(&quiet, "quiet", "q", false, "suppress progress output")
+	cmd.Flags().BoolVar(&allBranches, "all-branches", false, "include all branches")
+	cmd.Flags().StringVar(&branch, "branch", "", "filter by branch (default: current branch)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be done without executing")
+	cmd.Flags().IntVar(&limit, "limit", 20, "maximum number of jobs to compact at once")
+	cmd.Flags().BoolVar(&wait, "wait", false, "wait for consolidation to complete and show result")
+	cmd.Flags().DurationVar(&timeout, "timeout", 10*time.Minute, "timeout for --wait mode (e.g., 15m, 1h); 0 or negative values use the 10m default")
+
+	return cmd
+}
+
+type compactOptions struct {
+	agentName   string
+	model       string
+	reasoning   string
+	quiet       bool
+	allBranches bool
+	branch      string
+	dryRun      bool
+	limit       int
+	wait        bool
+	timeout     time.Duration
+}
+
+type jobReview struct {
+	jobID  int64
+	job    *storage.ReviewJob
+	review *storage.Review
+}
+
+// maxBatchFetch matches the server-side maxBatchSize for /api/jobs/batch.
+const maxBatchFetch = 100
+
+// fetchJobReviews fetches job and review data for all job IDs, chunking
+// into batches of maxBatchFetch to respect the server-side limit.
+// Returns successfully fetched entries and list of IDs that were processed.
+func fetchJobReviews(ctx context.Context, jobIDs []int64, quiet bool, cmd *cobra.Command) ([]jobReview, []int64, error) {
+	if !quiet {
+		cmd.Printf("  Fetching %d job(s)... ", len(jobIDs))
+	}
+
+	// Fetch in chunks to stay within server batch limit
+	allResults := make(map[int64]storage.JobWithReview)
+	for i := 0; i < len(jobIDs); i += maxBatchFetch {
+		end := i + maxBatchFetch
+		if end > len(jobIDs) {
+			end = len(jobIDs)
+		}
+		results, err := fetchJobBatch(ctx, jobIDs[i:end])
+		if err != nil {
+			return nil, nil, err
+		}
+		for k, v := range results {
+			allResults[k] = v
+		}
+	}
+
+	var jobReviews []jobReview
+	var successfulJobIDs []int64
+
+	// Iterate in the original order to maintain deterministic output
+	for _, jobID := range jobIDs {
+		entry, ok := allResults[jobID]
+		if !ok || entry.Review == nil {
+			if !quiet {
+				cmd.Printf("\n  Skipping job %d (no review found)", jobID)
+			}
+			continue
+		}
+
+		successfulJobIDs = append(successfulJobIDs, jobID)
+		jobReviews = append(jobReviews, jobReview{
+			jobID:  jobID,
+			job:    &entry.Job,
+			review: entry.Review,
+		})
+	}
+
+	if !quiet {
+		cmd.Printf("done (%d fetched)\n", len(jobReviews))
+	}
+
+	if len(jobReviews) == 0 {
+		return nil, nil, fmt.Errorf("failed to fetch any review outputs")
+	}
+
+	return jobReviews, successfulJobIDs, nil
+}
+
+// fetchJobBatch fetches a single batch of job reviews from the daemon.
+func fetchJobBatch(ctx context.Context, ids []int64) (map[int64]storage.JobWithReview, error) {
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"job_ids": ids,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal batch request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", serverAddr+"/api/jobs/batch", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("create batch request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("batch fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("batch fetch failed (%d): %s", resp.StatusCode, body)
+	}
+
+	var batchResp struct {
+		Results map[int64]storage.JobWithReview `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&batchResp); err != nil {
+		return nil, fmt.Errorf("decode batch response: %w", err)
+	}
+	return batchResp.Results, nil
+}
+
+// enqueueConsolidation creates and enqueues a consolidation job.
+// Returns the job ID for tracking.
+func enqueueConsolidation(ctx context.Context, cmd *cobra.Command, repoRoot string, jobReviews []jobReview, branchFilter string, opts compactOptions) (int64, error) {
+	// Build verification prompt
+	prompt := buildCompactPrompt(jobReviews, branchFilter, repoRoot)
+
+	// Resolve agent/model/reasoning using "fix" workflow so compact
+	// uses the same config as `roborev fix`.  Pass the resolved values
+	// to the daemon so it doesn't re-resolve under the "review" workflow.
+	cfg, err := config.LoadGlobal()
+	if err != nil {
+		return 0, fmt.Errorf("load config: %w", err)
+	}
+	reasoning, err := config.ResolveFixReasoning(opts.reasoning, repoRoot)
+	if err != nil {
+		return 0, fmt.Errorf("resolve reasoning: %w", err)
+	}
+	agentName := config.ResolveAgentForWorkflow(
+		opts.agentName, repoRoot, cfg, "fix", reasoning,
+	)
+	model := config.ResolveModelForWorkflow(
+		opts.model, repoRoot, cfg, "fix", reasoning,
+	)
+
+	if !opts.quiet {
+		cmd.Printf("\nRunning verification agent (%s) to check findings against current codebase...\n\n", agentName)
+	}
+
+	// Enqueue consolidated task job
+	timestamp := time.Now().Format("20060102-150405")
+	label := fmt.Sprintf("compact-%s-%s", branchFilter, timestamp)
+	if branchFilter == "" {
+		label = fmt.Sprintf("compact-all-%s", timestamp)
+	}
+
+	outputPrefix := buildCompactOutputPrefix(len(jobReviews), branchFilter, extractJobIDs(jobReviews))
+
+	// Use resolved values so daemon enqueues with the correct agent/model
+	resolved := opts
+	resolved.agentName = agentName
+	resolved.model = model
+	resolved.reasoning = reasoning
+	job, err := enqueueCompactJob(repoRoot, prompt, outputPrefix, label, branchFilter, resolved)
+	if err != nil {
+		return 0, fmt.Errorf("enqueue verification job: %w", err)
+	}
+
+	return job.ID, nil
+}
+
+// waitForConsolidation waits for a consolidation job to complete.
+func waitForConsolidation(ctx context.Context, cmd *cobra.Command, jobID int64, opts compactOptions) error {
+	timeout := opts.timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var output io.Writer
+	if !opts.quiet {
+		output = cmd.OutOrStdout()
+	}
+
+	_, err := waitForJobCompletion(ctx, serverAddr, jobID, output)
+	if err != nil {
+		return fmt.Errorf("verification failed: %w", err)
+	}
+
+	return nil
+}
+
+// runCompact verifies and consolidates unaddressed review findings.
+//
+// Known limitation: This is not an atomic operation. If another process marks jobs
+// as addressed or modifies them between the initial query and the final marking step,
+// there could be inconsistent state. This is acceptable since compact is typically
+// run manually by a single user. For concurrent operations, users should coordinate
+// to avoid running multiple compact commands simultaneously on the same branch.
+func runCompact(cmd *cobra.Command, opts compactOptions) error {
+	// Setup
+	if err := ensureDaemon(); err != nil {
+		return err
+	}
+
+	workDir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get working directory: %w", err)
+	}
+	repoRoot := workDir
+	if root, err := git.GetMainRepoRoot(workDir); err == nil {
+		repoRoot = root
+	}
+
+	branchFilter := opts.branch
+	if !opts.allBranches && branchFilter == "" {
+		branchFilter = git.GetCurrentBranch(repoRoot)
+	}
+
+	// Query and limit jobs, excluding non-review types (compact, task)
+	// to prevent recursive self-compaction loops
+	allJobs, err := queryUnaddressedJobs(repoRoot, branchFilter)
+	if err != nil {
+		return err
+	}
+	jobs := filterReviewJobs(allJobs)
+
+	if len(jobs) == 0 {
+		if !opts.quiet {
+			cmd.Println("No unaddressed jobs found.")
+		}
+		return nil
+	}
+
+	// Apply limit
+	if opts.limit > 0 && len(jobs) > opts.limit {
+		if !opts.quiet {
+			cmd.Printf("Found %d unaddressed jobs, limiting to %d (use --limit to adjust)\n\n",
+				len(jobs), opts.limit)
+		}
+		jobs = jobs[:opts.limit]
+	} else if !opts.quiet {
+		branchMsg := ""
+		if branchFilter != "" {
+			branchMsg = fmt.Sprintf(" on branch %s", branchFilter)
+		}
+		cmd.Printf("Found %d unaddressed job(s)%s\n\n", len(jobs), branchMsg)
+	}
+
+	// Warn about very large limits
+	if opts.limit > 50 && !opts.quiet {
+		cmd.Printf("Warning: --limit=%d may create a very large prompt\n\n", opts.limit)
+	}
+
+	// Extract job IDs
+	jobIDs := make([]int64, len(jobs))
+	for i, j := range jobs {
+		jobIDs[i] = j.ID
+	}
+
+	// Dry-run early exit
+	if opts.dryRun {
+		cmd.Println("Would verify and consolidate these reviews")
+		cmd.Println("Would create 1 consolidated review job")
+		cmd.Printf("Would mark %d jobs as addressed\n\n", len(jobIDs))
+		cmd.Println("Run without --dry-run to execute.")
+		return nil
+	}
+
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Fetch review outputs
+	if !opts.quiet {
+		cmd.Println("Fetching review outputs:")
+	}
+
+	jobReviews, successfulJobIDs, err := fetchJobReviews(ctx, jobIDs, opts.quiet, cmd)
+	if err != nil {
+		return err
+	}
+
+	// Enqueue consolidation job
+	consolidatedJobID, err := enqueueConsolidation(ctx, cmd, repoRoot, jobReviews, branchFilter, opts)
+	if err != nil {
+		return err
+	}
+
+	// Store source job IDs for automatic marking when job completes
+	// CRITICAL: This must succeed or source jobs will never be marked as addressed
+	if err := writeCompactMetadata(consolidatedJobID, successfulJobIDs); err != nil {
+		// Try to cancel the job we just created
+		if cancelErr := cancelJob(serverAddr, consolidatedJobID); cancelErr != nil {
+			// Best effort - log but don't mask the original error
+			log.Printf("Failed to cancel job %d after metadata write failure: %v", consolidatedJobID, cancelErr)
+		}
+		return fmt.Errorf("failed to write compact metadata: %w", err)
+	}
+
+	if !opts.quiet {
+		cmd.Printf("\nEnqueued consolidation job %d\n", consolidatedJobID)
+	}
+
+	// If --wait flag not set, return immediately (background mode)
+	if !opts.wait {
+		if !opts.quiet {
+			cmd.Println("\nConsolidation running in background.")
+			cmd.Println("\nCheck progress: roborev status")
+			cmd.Println("View results:   roborev tui")
+			cmd.Printf("Wait for job:   roborev compact --wait (or wait for job %d)\n", consolidatedJobID)
+		}
+		return nil
+	}
+
+	// Wait for completion
+	if !opts.quiet {
+		cmd.Println("\nWaiting for consolidation to complete...")
+	}
+
+	err = waitForConsolidation(ctx, cmd, consolidatedJobID, opts)
+	if err != nil {
+		return err
+	}
+
+	if !opts.quiet {
+		cmd.Println("\nVerification complete!")
+		cmd.Printf("\nConsolidated review created: job %d\n", consolidatedJobID)
+	}
+
+	// Note: source jobs are automatically marked as addressed by the daemon worker
+	// when the compact job completes (see worker.go markCompactSourceJobs).
+
+	// Show next steps
+	if !opts.quiet {
+		cmd.Println("\nView with: roborev tui")
+		cmd.Printf("Fix with: roborev fix %d\n", consolidatedJobID)
+	}
+
+	return nil
+}
+
+func buildCompactPrompt(jobReviews []jobReview, branch, repoRoot string) string {
+	var sb strings.Builder
+
+	sb.WriteString("# Verification and Consolidation Request\n\n")
+	sb.WriteString("You are a code reviewer tasked with verifying and consolidating previous review findings.\n\n")
+
+	// Include project review guidelines so the compact agent
+	// respects the same rules as regular reviews.
+	if repoCfg, err := config.LoadRepoConfig(repoRoot); err == nil && repoCfg != nil && repoCfg.ReviewGuidelines != "" {
+		sb.WriteString("## Project Guidelines\n\n")
+		sb.WriteString(strings.TrimSpace(repoCfg.ReviewGuidelines))
+		sb.WriteString("\n\n")
+	}
+
+	sb.WriteString("## Instructions\n\n")
+	sb.WriteString("1. **Verify each finding against the current codebase:**\n")
+	sb.WriteString("   - Search the codebase to check if the issue still exists\n")
+	sb.WriteString("   - Use wide code search patterns (grep, find files, read context)\n")
+	sb.WriteString("   - Mark findings as VERIFIED or FALSE_POSITIVE\n\n")
+
+	sb.WriteString("2. **Consolidate related findings:**\n")
+	sb.WriteString("   - Group findings that address the same underlying issue\n")
+	sb.WriteString("   - Merge duplicate findings from different reviews\n")
+	sb.WriteString("   - Provide a single comprehensive description for each group\n\n")
+
+	sb.WriteString("3. **Output format:**\n")
+	sb.WriteString("   - List only VERIFIED findings in your output\n")
+	sb.WriteString("   - Use the same severity levels (Critical, High, Medium, Low)\n")
+	sb.WriteString("   - Include file and line references where possible\n")
+	sb.WriteString("   - Explain what the issue is and why it matters\n\n")
+
+	sb.WriteString("## Unaddressed Review Findings\n\n")
+	reviewWord := "review"
+	if len(jobReviews) != 1 {
+		reviewWord = "reviews"
+	}
+	sb.WriteString(fmt.Sprintf("Below are %d unaddressed %s", len(jobReviews), reviewWord))
+	if branch != "" {
+		sb.WriteString(fmt.Sprintf(" from branch %s", branch))
+	}
+	sb.WriteString(":\n\n")
+
+	for i, jr := range jobReviews {
+		sb.WriteString(fmt.Sprintf("--- Review %d (Job %d", i+1, jr.jobID))
+		if jr.job.GitRef != "" {
+			sb.WriteString(fmt.Sprintf(" — %s", shortSHA(jr.job.GitRef)))
+		}
+		sb.WriteString(") ---\n")
+		sb.WriteString(jr.review.Output)
+		sb.WriteString("\n\n")
+	}
+
+	sb.WriteString("## Expected Output\n\n")
+	sb.WriteString("Provide a consolidated review output containing only verified findings.\n")
+	sb.WriteString("Format it exactly like a code review, with:\n")
+	sb.WriteString("- Brief summary of findings\n")
+	sb.WriteString("- Each verified finding with severity, file/line, description\n")
+	sb.WriteString("- NO false positives or already-fixed issues\n\n")
+	sb.WriteString("If NO findings remain after verification, state \"All previous findings have been addressed.\"\n")
+
+	return sb.String()
+}
+
+func buildCompactOutputPrefix(jobCount int, branch string, jobIDs []int64) string {
+	var sb strings.Builder
+	sb.WriteString("## Compact Analysis\n\n")
+	reviewWord := "review"
+	if jobCount != 1 {
+		reviewWord = "reviews"
+	}
+	sb.WriteString(fmt.Sprintf("Verified and consolidated %d unaddressed %s", jobCount, reviewWord))
+	if branch != "" {
+		sb.WriteString(fmt.Sprintf(" from branch %s", branch))
+	}
+	sb.WriteString("\n\n")
+	sb.WriteString(fmt.Sprintf("Original jobs: %s\n\n", formatJobIDs(jobIDs)))
+	sb.WriteString("---\n\n")
+	return sb.String()
+}
+
+func enqueueCompactJob(repoRoot, prompt, outputPrefix, label, branch string, opts compactOptions) (*storage.ReviewJob, error) {
+	if branch == "" {
+		branch = git.GetCurrentBranch(repoRoot)
+	}
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"repo_path":     repoRoot,
+		"git_ref":       label,
+		"branch":        branch,
+		"agent":         opts.agentName,
+		"model":         opts.model,
+		"reasoning":     opts.reasoning,
+		"custom_prompt": prompt,
+		"output_prefix": outputPrefix,
+		"agentic":       true,
+		"job_type":      "compact",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal enqueue request: %w", err)
+	}
+
+	resp, err := http.Post(serverAddr+"/api/enqueue", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("connect to daemon: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("enqueue failed: %s", body)
+	}
+
+	var job storage.ReviewJob
+	if err := json.Unmarshal(body, &job); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+
+	return &job, nil
+}
+
+// isValidConsolidatedReview delegates to the shared daemon package
+// so CLI --wait and daemon background mode use the same validation.
+var isValidConsolidatedReview = daemon.IsValidCompactOutput
+
+// filterReviewJobs excludes non-review job types (compact, task) from
+// the source list to prevent recursive self-compaction loops.
+func filterReviewJobs(jobs []storage.ReviewJob) []storage.ReviewJob {
+	filtered := make([]storage.ReviewJob, 0, len(jobs))
+	for _, j := range jobs {
+		switch j.JobType {
+		case "compact", "task":
+			continue
+		default:
+			filtered = append(filtered, j)
+		}
+	}
+	return filtered
+}
+
+// extractJobIDs extracts job IDs from jobReview slice
+func extractJobIDs(reviews []jobReview) []int64 {
+	ids := make([]int64, len(reviews))
+	for i, jr := range reviews {
+		ids[i] = jr.jobID
+	}
+	return ids
+}
+
+// cancelJob cancels a job by ID via the daemon API
+func cancelJob(serverAddr string, jobID int64) error {
+	reqBody, err := json.Marshal(map[string]interface{}{"job_id": jobID})
+	if err != nil {
+		return fmt.Errorf("marshal cancel request: %w", err)
+	}
+	resp, err := http.Post(serverAddr+"/api/job/cancel", "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return fmt.Errorf("connect to daemon: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("cancel failed: %s", body)
+	}
+
+	return nil
+}
+
+// writeCompactMetadata writes source job IDs to a metadata file for later processing
+func writeCompactMetadata(consolidatedJobID int64, sourceJobIDs []int64) error {
+	if len(sourceJobIDs) == 0 {
+		// Nothing to track - skip metadata file creation
+		return nil
+	}
+
+	metadata := struct {
+		SourceJobIDs []int64 `json:"source_job_ids"`
+	}{
+		SourceJobIDs: sourceJobIDs,
+	}
+
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("marshal metadata: %w", err)
+	}
+
+	dataDir := config.DataDir()
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return fmt.Errorf("create data directory: %w", err)
+	}
+
+	path := fmt.Sprintf("%s/compact-%d.json", dataDir, consolidatedJobID)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("write metadata file: %w", err)
+	}
+
+	return nil
+}

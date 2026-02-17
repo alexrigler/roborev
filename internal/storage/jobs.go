@@ -742,6 +742,7 @@ type EnqueueOpts struct {
 	OutputPrefix string // Prefix to prepend to review output
 	Agentic      bool   // Allow file edits and command execution
 	Label        string // Display label in TUI for task jobs (default: "prompt")
+	JobType      string // Explicit job type (review/range/dirty/task/compact); inferred if empty
 }
 
 // EnqueueJob creates a new review job. The job type is inferred from opts.
@@ -751,17 +752,21 @@ func (db *DB) EnqueueJob(opts EnqueueOpts) (*ReviewJob, error) {
 		reasoning = "thorough"
 	}
 
-	// Determine job type from fields
+	// Determine job type from fields (use explicit type if provided)
 	var jobType string
-	switch {
-	case opts.Prompt != "":
-		jobType = JobTypeTask
-	case opts.DiffContent != "":
-		jobType = JobTypeDirty
-	case opts.CommitID > 0:
-		jobType = JobTypeReview
-	default:
-		jobType = JobTypeRange
+	if opts.JobType != "" {
+		jobType = opts.JobType
+	} else {
+		switch {
+		case opts.Prompt != "":
+			jobType = JobTypeTask
+		case opts.DiffContent != "":
+			jobType = JobTypeDirty
+		case opts.CommitID > 0:
+			jobType = JobTypeReview
+		default:
+			jobType = JobTypeRange
+		}
 	}
 
 	// For task jobs, use Label as git_ref display value
@@ -875,9 +880,11 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 	var agenticInt int
 	var jobType sql.NullString
 	var reviewType sql.NullString
+	var outputPrefix sql.NullString
 	err = db.QueryRow(`
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.agent, j.model, j.reasoning, j.status, j.enqueued_at,
-		       r.root_path, r.name, c.subject, j.diff_content, j.prompt, COALESCE(j.agentic, 0), j.job_type, j.review_type
+		       r.root_path, r.name, c.subject, j.diff_content, j.prompt, COALESCE(j.agentic, 0), j.job_type, j.review_type,
+		       j.output_prefix
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
@@ -885,7 +892,8 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 		ORDER BY j.started_at DESC
 		LIMIT 1
 	`, workerID).Scan(&job.ID, &job.RepoID, &commitID, &job.GitRef, &branch, &job.Agent, &model, &job.Reasoning, &job.Status, &enqueuedAt,
-		&job.RepoPath, &job.RepoName, &commitSubject, &diffContent, &prompt, &agenticInt, &jobType, &reviewType)
+		&job.RepoPath, &job.RepoName, &commitSubject, &diffContent, &prompt, &agenticInt, &jobType, &reviewType,
+		&outputPrefix)
 	if err != nil {
 		return nil, err
 	}
@@ -914,6 +922,9 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 	}
 	if reviewType.Valid {
 		job.ReviewType = reviewType.String
+	}
+	if outputPrefix.Valid {
+		job.OutputPrefix = outputPrefix.String
 	}
 	job.EnqueuedAt = parseSQLiteTime(enqueuedAt)
 	job.Status = JobStatusRunning

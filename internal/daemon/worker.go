@@ -280,22 +280,22 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	wp.registerRunningJob(job.ID, cancel)
 	defer wp.unregisterRunningJob(job.ID)
 
-	// Build the prompt (or use pre-stored prompt for task jobs)
+	// Build the prompt (or use pre-stored prompt for task/compact jobs)
 	var reviewPrompt string
 	var err error
-	if job.IsTaskJob() && job.Prompt != "" {
-		// Task job (run, analyze, custom) - prepend agent-specific preamble if available
+	if job.IsPromptJob() && job.Prompt != "" {
+		// Prompt-native job (task, compact) — prepend agent-specific preamble
 		preamble := prompt.GetSystemPrompt(job.Agent, "run")
 		if preamble != "" {
 			reviewPrompt = preamble + "\n" + job.Prompt
 		} else {
 			reviewPrompt = job.Prompt
 		}
-	} else if job.IsTaskJob() {
-		// Task job with missing prompt - likely a daemon version mismatch where
-		// the prompt wasn't stored or loaded. Fail with a clear error instead of
-		// trying to git log on an analysis type name like "complexity".
-		err = fmt.Errorf("task job %d has no stored prompt (git_ref=%q); restart the daemon with 'roborev daemon restart'", job.ID, job.GitRef)
+	} else if job.IsPromptJob() {
+		// Prompt-native job (task/compact) with missing prompt — likely a
+		// daemon version mismatch or storage issue. Fail clearly instead
+		// of trying to build a prompt from a non-git label.
+		err = fmt.Errorf("%s job %d has no stored prompt (git_ref=%q); restart the daemon with 'roborev daemon restart'", job.JobType, job.ID, job.GitRef)
 	} else if job.DiffContent != nil {
 		// Dirty job - use pre-captured diff
 		reviewPrompt, err = wp.promptBuilder.BuildDirty(job.RepoPath, *job.DiffContent, job.RepoID, cfg.ReviewContextCount, job.Agent, job.ReviewType)
@@ -380,10 +380,40 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		return
 	}
 
-	// Store the result (use actual agent name, not requested)
+	// For compact jobs, validate raw agent output before storing.
+	// Invalid output (empty, error patterns) should fail the job,
+	// not produce a "done" review that misleads --wait callers.
+	if job.JobType == "compact" && !IsValidCompactOutput(output) {
+		log.Printf("[%s] Compact job %d produced invalid output, failing", workerID, job.ID)
+		wp.failOrRetry(workerID, job, agentName, "compact output invalid (empty or error)")
+		return
+	}
+
+	// Store the result (use actual agent name, not requested).
+	// CompleteJob is a no-op (returns nil) if the job was canceled
+	// between agent finish and now.
 	if err := wp.db.CompleteJob(job.ID, agentName, reviewPrompt, output); err != nil {
 		log.Printf("[%s] Error storing review: %v", workerID, err)
 		return
+	}
+
+	// For compact jobs, verify the job actually completed (not
+	// silently skipped due to cancel race) before marking source
+	// jobs as addressed. CompleteJob no-ops when status != running.
+	if job.JobType == "compact" {
+		j, err := wp.db.GetJobByID(job.ID)
+		if err != nil {
+			// Transient read error — skip source marking but don't
+			// suppress the completion broadcast below.
+			log.Printf("[%s] Compact job %d: failed to verify status: %v", workerID, job.ID, err)
+		} else if j.Status != storage.JobStatusDone {
+			// Job was canceled between agent finish and CompleteJob.
+			// No review was stored, so skip broadcast too.
+			log.Printf("[%s] Compact job %d not completed (status=%s), skipping source marking", workerID, job.ID, j.Status)
+			return
+		} else if err := wp.markCompactSourceJobs(workerID, job.ID); err != nil {
+			log.Printf("[%s] Warning: failed to mark compact source jobs for job %d: %v", workerID, job.ID, err)
+		}
 	}
 
 	log.Printf("[%s] Completed job %d", workerID, job.ID)
@@ -441,4 +471,61 @@ func (wp *WorkerPool) broadcastFailed(job *storage.ReviewJob, agentName, errorMs
 		Agent:    agentName,
 		Error:    errorMsg,
 	})
+}
+
+// markCompactSourceJobs marks all source jobs as addressed for a completed compact job
+func (wp *WorkerPool) markCompactSourceJobs(workerID string, jobID int64) error {
+	// Read metadata file, retrying briefly in case the CLI hasn't finished
+	// writing it yet (the file is written after enqueue returns the job ID).
+	var metadata *CompactMetadata
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		metadata, err = ReadCompactMetadata(jobID)
+		if err == nil {
+			break
+		}
+		if attempt < 2 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	if err != nil {
+		log.Printf("[%s] No compact metadata found for job %d after retries: %v", workerID, jobID, err)
+		return nil
+	}
+
+	if len(metadata.SourceJobIDs) == 0 {
+		log.Printf("[%s] No source jobs to mark for compact job %d", workerID, jobID)
+		return nil
+	}
+
+	log.Printf("[%s] Marking %d source jobs as addressed for compact job %d", workerID, len(metadata.SourceJobIDs), jobID)
+
+	// Mark each source job as addressed
+	var failedIDs []int64
+	for _, srcJobID := range metadata.SourceJobIDs {
+		if err := wp.db.MarkReviewAddressedByJobID(srcJobID, true); err != nil {
+			log.Printf("[%s] Failed to mark job %d as addressed: %v", workerID, srcJobID, err)
+			failedIDs = append(failedIDs, srcJobID)
+		}
+	}
+
+	successCount := len(metadata.SourceJobIDs) - len(failedIDs)
+	if successCount > 0 {
+		log.Printf("[%s] Marked %d/%d source jobs as addressed", workerID, successCount, len(metadata.SourceJobIDs))
+	}
+
+	// Only delete metadata when all source jobs were marked.
+	// On partial failure, keep metadata so a re-run can retry.
+	if len(failedIDs) > 0 {
+		log.Printf("[%s] Keeping compact metadata for job %d (%d jobs failed)", workerID, jobID, len(failedIDs))
+		return nil
+	}
+
+	if err := DeleteCompactMetadata(jobID); err != nil {
+		log.Printf("[%s] Failed to delete compact metadata for job %d: %v", workerID, jobID, err)
+	} else {
+		log.Printf("[%s] Cleaned up compact metadata for job %d", workerID, jobID)
+	}
+
+	return nil
 }
