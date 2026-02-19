@@ -1,0 +1,72 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"testing"
+
+	"github.com/roborev-dev/roborev/internal/storage"
+)
+
+func TestMockDaemonBuilderMultipleReviews(t *testing.T) {
+	// This test verifies that multiple calls to WithReview for different job IDs
+	// are correctly stored and retrieved by the mock server.
+	builder := newMockDaemonBuilder(t).
+		WithReview(10, "Review for Job 10").
+		WithReview(20, "Review for Job 20").
+		WithReview(30, "Review for Job 30")
+
+	ts, cleanup := builder.Build()
+	defer cleanup()
+
+	tests := []struct {
+		name       string
+		query      string
+		wantJobID  int64
+		wantOutput string
+		wantStatus int
+	}{
+		{"Valid-10", "job_id=10", 10, "Review for Job 10", http.StatusOK},
+		{"Valid-20", "job_id=20", 20, "Review for Job 20", http.StatusOK},
+		{"Valid-30", "job_id=30", 30, "Review for Job 30", http.StatusOK},
+		{"NotFound-40", "job_id=40", 0, "", http.StatusNotFound},
+		{"Invalid-abc", "job_id=abc", 0, "", http.StatusBadRequest},
+		{"PartialNumeric", "job_id=10abc", 0, "", http.StatusBadRequest},
+		{"Missing", "", 0, "", http.StatusBadRequest},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			url := fmt.Sprintf("%s/api/review", ts.URL)
+			if tt.query != "" {
+				url += "?" + tt.query
+			}
+			resp, err := http.Get(url)
+			if err != nil {
+				t.Fatalf("failed to make request: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("expected status %d, got %d", tt.wantStatus, resp.StatusCode)
+			}
+
+			if tt.wantStatus != http.StatusOK {
+				return
+			}
+
+			var review storage.Review
+			if err := json.NewDecoder(resp.Body).Decode(&review); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+
+			if review.JobID != tt.wantJobID {
+				t.Errorf("expected JobID %d, got %d", tt.wantJobID, review.JobID)
+			}
+			if review.Output != tt.wantOutput {
+				t.Errorf("expected output %q, got %q", tt.wantOutput, review.Output)
+			}
+		})
+	}
+}

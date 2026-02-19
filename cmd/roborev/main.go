@@ -44,6 +44,17 @@ var (
 	// Polling intervals for waitForJob - exposed for testing
 	pollStartInterval = 1 * time.Second
 	pollMaxInterval   = 5 * time.Second
+
+	// setupSignalHandler allows tests to mock signal handling
+	setupSignalHandler = func() (chan os.Signal, func()) {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt)
+		if runtime.GOOS != "windows" {
+			// SIGTERM is not available on Windows
+			signal.Notify(sigCh, os.Signal(syscall.Signal(15))) // SIGTERM
+		}
+		return sigCh, func() { signal.Stop(sigCh) }
+	}
 )
 
 func main() {
@@ -274,6 +285,20 @@ func filterGitEnv(env []string) []string {
 	return result
 }
 
+func isGoTestBinaryPath(exePath string) bool {
+	base := strings.ToLower(filepath.Base(exePath))
+	return strings.HasSuffix(base, ".test") ||
+		strings.HasSuffix(base, ".test.exe")
+}
+
+func shouldRefuseAutoStartDaemon(exePath string) bool {
+	if !isGoTestBinaryPath(exePath) {
+		return false
+	}
+	// Allow explicit opt-in for tests that intentionally want to auto-start.
+	return os.Getenv("ROBOREV_TEST_ALLOW_AUTOSTART") != "1"
+}
+
 func startDaemon() error {
 	if verbose {
 		fmt.Println("Starting daemon...")
@@ -283,6 +308,12 @@ func startDaemon() error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("failed to find executable: %w", err)
+	}
+	if shouldRefuseAutoStartDaemon(exe) {
+		return fmt.Errorf(
+			"refusing to auto-start daemon from go test binary (%s)",
+			filepath.Base(exe),
+		)
 	}
 
 	cmd := exec.Command(exe, "daemon", "run")
@@ -694,16 +725,17 @@ func daemonRunCmd() *cobra.Command {
 			}
 
 			// Handle shutdown signals
-			sigCh := make(chan os.Signal, 1)
-			signal.Notify(sigCh, os.Interrupt)
-			if runtime.GOOS != "windows" {
-				// SIGTERM is not available on Windows
-				signal.Notify(sigCh, os.Signal(syscall.Signal(15))) // SIGTERM
-			}
+			sigCh, stopSignals := setupSignalHandler()
+			defer stopSignals()
 
 			go func() {
-				sig := <-sigCh
-				log.Printf("Received signal %v, shutting down...", sig)
+				select {
+				case sig := <-sigCh:
+					log.Printf("Received signal %v, shutting down...", sig)
+				case <-cmd.Context().Done():
+					log.Printf("Context cancelled, shutting down...")
+				}
+
 				cancel() // Cancel context to stop config watcher
 				if ciPoller != nil {
 					ciPoller.Stop()

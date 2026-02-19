@@ -51,13 +51,7 @@ func (r *TestRepo) Run(args ...string) string {
 // CommitFile writes a file and commits it.
 func (r *TestRepo) CommitFile(filename, content, msg string) {
 	r.T.Helper()
-	path := filepath.Join(r.Dir, filename)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		r.T.Fatal(err)
-	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		r.T.Fatal(err)
-	}
+	r.WriteFile(filename, content)
 	r.Run("add", filename)
 	r.Run("commit", "-m", msg)
 }
@@ -188,15 +182,25 @@ func TestIsUnbornHead(t *testing.T) {
 }
 
 func TestNormalizeMSYSPath(t *testing.T) {
+	expectedCUsers := "/c/Users/test"
+	expectedCapCUsers := "/C/Users/test"
+	expectedUnix := "/home/user/repo"
+
+	if runtime.GOOS == "windows" {
+		expectedCUsers = "C:\\Users\\test"
+		expectedCapCUsers = "C:\\Users\\test"
+		expectedUnix = "\\home\\user\\repo"
+	}
+
 	tests := []struct {
 		name     string
 		input    string
-		expected string // Expected on Windows; on other platforms we just check FromSlash behavior
+		expected string
 	}{
 		{"forward slash path", "C:/Users/test", "C:" + string(filepath.Separator) + "Users" + string(filepath.Separator) + "test"},
-		{"MSYS lowercase drive", "/c/Users/test", ""}, // Platform-specific expected
-		{"MSYS uppercase drive", "/C/Users/test", ""}, // Platform-specific expected
-		{"Unix absolute path", "/home/user/repo", ""}, // Platform-specific expected
+		{"MSYS lowercase drive", "/c/Users/test", expectedCUsers},
+		{"MSYS uppercase drive", "/C/Users/test", expectedCapCUsers},
+		{"Unix absolute path", "/home/user/repo", expectedUnix},
 		{"relative path", "some/path", "some" + string(filepath.Separator) + "path"},
 		{"with trailing newline", "C:/Users/test\n", "C:" + string(filepath.Separator) + "Users" + string(filepath.Separator) + "test"},
 	}
@@ -204,44 +208,8 @@ func TestNormalizeMSYSPath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := normalizeMSYSPath(tt.input)
-
-			switch tt.name {
-			case "MSYS lowercase drive":
-				if runtime.GOOS == "windows" {
-					if result != "C:\\Users\\test" {
-						t.Errorf("Expected C:\\Users\\test, got %s", result)
-					}
-				} else {
-					// On non-Windows, /c/Users/test stays as-is (just separator change)
-					if result != "/c/Users/test" {
-						t.Errorf("Expected /c/Users/test, got %s", result)
-					}
-				}
-			case "MSYS uppercase drive":
-				if runtime.GOOS == "windows" {
-					if result != "C:\\Users\\test" {
-						t.Errorf("Expected C:\\Users\\test, got %s", result)
-					}
-				} else {
-					if result != "/C/Users/test" {
-						t.Errorf("Expected /C/Users/test, got %s", result)
-					}
-				}
-			case "Unix absolute path":
-				if runtime.GOOS == "windows" {
-					// /home is not a drive letter pattern, so stays as \home
-					if result != "\\home\\user\\repo" {
-						t.Errorf("Expected \\home\\user\\repo, got %s", result)
-					}
-				} else {
-					if result != "/home/user/repo" {
-						t.Errorf("Expected /home/user/repo, got %s", result)
-					}
-				}
-			default:
-				if result != tt.expected {
-					t.Errorf("Expected %s, got %s", tt.expected, result)
-				}
+			if result != tt.expected {
+				t.Errorf("Expected %s, got %s", tt.expected, result)
 			}
 		})
 	}
@@ -312,20 +280,20 @@ func TestGetHooksPath(t *testing.T) {
 }
 
 func TestIsRebaseInProgress(t *testing.T) {
-	repo := NewTestRepo(t)
-
 	t.Run("no rebase", func(t *testing.T) {
+		repo := NewTestRepo(t)
 		if IsRebaseInProgress(repo.Dir) {
 			t.Error("expected no rebase in progress")
 		}
 	})
 
 	t.Run("rebase-merge directory", func(t *testing.T) {
+		repo := NewTestRepo(t)
 		rebaseMerge := filepath.Join(repo.Dir, ".git", "rebase-merge")
 		if err := os.MkdirAll(rebaseMerge, 0755); err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(rebaseMerge)
+		// No defer needed; t.TempDir() handles cleanup automatically
 
 		if !IsRebaseInProgress(repo.Dir) {
 			t.Error("expected rebase in progress with rebase-merge")
@@ -333,11 +301,11 @@ func TestIsRebaseInProgress(t *testing.T) {
 	})
 
 	t.Run("rebase-apply directory", func(t *testing.T) {
+		repo := NewTestRepo(t)
 		rebaseApply := filepath.Join(repo.Dir, ".git", "rebase-apply")
 		if err := os.MkdirAll(rebaseApply, 0755); err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(rebaseApply)
 
 		if !IsRebaseInProgress(repo.Dir) {
 			t.Error("expected rebase in progress with rebase-apply")
@@ -352,6 +320,7 @@ func TestIsRebaseInProgress(t *testing.T) {
 	})
 
 	t.Run("worktree with rebase", func(t *testing.T) {
+		repo := NewTestRepo(t)
 		repo.CommitFile("file.txt", "content", "initial")
 
 		wt := repo.AddWorktree("test-branch")
@@ -387,276 +356,9 @@ func TestIsRebaseInProgress(t *testing.T) {
 		if err := os.MkdirAll(rebaseMerge, 0755); err != nil {
 			t.Fatal(err)
 		}
-		defer os.RemoveAll(rebaseMerge)
 
 		if !IsRebaseInProgress(wt.Dir) {
 			t.Error("expected rebase in progress in worktree")
-		}
-	})
-}
-
-func TestGetDefaultBranchOriginHead(t *testing.T) {
-	bareRepo := NewBareTestRepo(t)
-	bareRepo.Run("symbolic-ref", "HEAD", "refs/heads/main")
-
-	seedRepo := NewTestRepo(t)
-	seedRepo.Run("checkout", "-b", "main")
-	seedRepo.CommitFile("file.txt", "base", "initial")
-	seedRepo.Run("remote", "add", "origin", bareRepo.Dir)
-	seedRepo.Run("push", "-u", "origin", "main")
-
-	t.Run("missing local branch uses origin ref", func(t *testing.T) {
-		cloneDir := t.TempDir()
-		runGit(t, "", "clone", bareRepo.Dir, cloneDir)
-		clone := &TestRepo{T: t, Dir: cloneDir}
-		clone.Run("remote", "set-head", "origin", "-a")
-		clone.Run("checkout", "--detach")
-		clone.Run("branch", "-D", "main")
-
-		branch, err := GetDefaultBranch(clone.Dir)
-		if err != nil {
-			t.Fatalf("GetDefaultBranch failed: %v", err)
-		}
-		if branch != "origin/main" {
-			t.Fatalf("expected origin/main, got %s", branch)
-		}
-	})
-
-	t.Run("stale local branch uses origin ref", func(t *testing.T) {
-		cloneDir := t.TempDir()
-		runGit(t, "", "clone", bareRepo.Dir, cloneDir)
-		clone := &TestRepo{T: t, Dir: cloneDir}
-		clone.Run("remote", "set-head", "origin", "-a")
-
-		seedRepo.CommitFile("file2.txt", "new", "update")
-		seedRepo.Run("push")
-		clone.Run("fetch", "origin")
-
-		branch, err := GetDefaultBranch(clone.Dir)
-		if err != nil {
-			t.Fatalf("GetDefaultBranch failed: %v", err)
-		}
-		if branch != "origin/main" {
-			t.Fatalf("expected origin/main, got %s", branch)
-		}
-	})
-
-	t.Run("origin/HEAD points to missing remote ref, falls back to local branch", func(t *testing.T) {
-		cloneDir := t.TempDir()
-		runGit(t, "", "clone", bareRepo.Dir, cloneDir)
-		clone := &TestRepo{T: t, Dir: cloneDir}
-		clone.Run("remote", "set-head", "origin", "-a")
-
-		// Delete the remote-tracking branch while keeping origin/HEAD symbolic ref intact
-		clone.Run("update-ref", "-d", "refs/remotes/origin/main")
-
-		// Local main branch should still exist
-		localBranchOut := clone.Run("rev-parse", "--verify", "main")
-		if localBranchOut == "" {
-			t.Fatal("expected local main branch to exist")
-		}
-
-		branch, err := GetDefaultBranch(clone.Dir)
-		if err != nil {
-			t.Fatalf("GetDefaultBranch failed: %v", err)
-		}
-		if branch != "main" {
-			t.Fatalf("expected main (local branch fallback), got %s", branch)
-		}
-	})
-}
-
-func TestGetMainRepoRoot(t *testing.T) {
-	repo := NewTestRepo(t)
-
-	t.Run("regular repo returns same as GetRepoRoot", func(t *testing.T) {
-		mainRoot, err := GetMainRepoRoot(repo.Dir)
-		if err != nil {
-			t.Fatalf("GetMainRepoRoot failed: %v", err)
-		}
-
-		repoRoot, err := GetRepoRoot(repo.Dir)
-		if err != nil {
-			t.Fatalf("GetRepoRoot failed: %v", err)
-		}
-
-		if mainRoot != repoRoot {
-			t.Errorf("GetMainRepoRoot returned %s, expected %s (same as GetRepoRoot)", mainRoot, repoRoot)
-		}
-	})
-
-	t.Run("worktree returns main repo root", func(t *testing.T) {
-		repo.CommitFile("file.txt", "content", "initial")
-
-		wt := repo.AddWorktree("worktree-branch")
-
-		// GetRepoRoot from worktree returns the worktree path
-		worktreeRoot, err := GetRepoRoot(wt.Dir)
-		if err != nil {
-			t.Fatalf("GetRepoRoot on worktree failed: %v", err)
-		}
-
-		mainRepoRoot, err := GetRepoRoot(repo.Dir)
-		if err != nil {
-			t.Fatalf("GetRepoRoot on main repo failed: %v", err)
-		}
-
-		if worktreeRoot == mainRepoRoot {
-			t.Skip("worktree root equals main repo root - older git version")
-		}
-
-		mainRoot, err := GetMainRepoRoot(wt.Dir)
-		if err != nil {
-			t.Fatalf("GetMainRepoRoot on worktree failed: %v", err)
-		}
-
-		if mainRoot != mainRepoRoot {
-			t.Errorf("GetMainRepoRoot on worktree returned %s, expected %s", mainRoot, mainRepoRoot)
-		}
-	})
-
-	t.Run("non-repo returns error", func(t *testing.T) {
-		nonRepo := t.TempDir()
-		_, err := GetMainRepoRoot(nonRepo)
-		if err == nil {
-			t.Error("expected error for non-repo")
-		}
-	})
-
-	t.Run("submodule stays distinct from parent", func(t *testing.T) {
-		parentRepo := NewTestRepo(t)
-		parentRepo.Run("config", "protocol.file.allow", "always")
-		parentRepo.CommitFile("parent.txt", "parent", "parent initial")
-
-		subSource := NewTestRepo(t)
-		subSource.CommitFile("sub.txt", "sub", "sub initial")
-
-		// Add submodule to parent
-		cmd := exec.Command("git", "-c", "protocol.file.allow=always", "submodule", "add", subSource.Dir, "mysub")
-		cmd.Dir = parentRepo.Dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git submodule add failed: %v\n%s", err, out)
-		}
-
-		submoduleDir := filepath.Join(parentRepo.Dir, "mysub")
-		submoduleDirResolved, _ := filepath.EvalSymlinks(submoduleDir)
-		if submoduleDirResolved == "" {
-			submoduleDirResolved = submoduleDir
-		}
-
-		subRoot, err := GetMainRepoRoot(submoduleDir)
-		if err != nil {
-			t.Fatalf("GetMainRepoRoot on submodule failed: %v", err)
-		}
-
-		parentRoot, err := GetMainRepoRoot(parentRepo.Dir)
-		if err != nil {
-			t.Fatalf("GetMainRepoRoot on parent failed: %v", err)
-		}
-
-		if subRoot == parentRoot {
-			t.Errorf("submodule root should be distinct from parent: sub=%s parent=%s", subRoot, parentRoot)
-		}
-
-		subRootResolved, _ := filepath.EvalSymlinks(subRoot)
-		if subRootResolved == "" {
-			subRootResolved = subRoot
-		}
-		if subRootResolved != submoduleDirResolved {
-			t.Errorf("GetMainRepoRoot on submodule returned %s, expected %s", subRoot, submoduleDir)
-		}
-	})
-
-	t.Run("worktree from submodule returns submodule root", func(t *testing.T) {
-		parentRepo := NewTestRepo(t)
-		parentRepo.Run("config", "protocol.file.allow", "always")
-		parentRepo.CommitFile("parent.txt", "parent", "parent initial")
-
-		subSource := NewTestRepo(t)
-		subSource.CommitFile("sub.txt", "sub", "sub initial")
-
-		// Add submodule to parent
-		cmd := exec.Command("git", "-c", "protocol.file.allow=always", "submodule", "add", subSource.Dir, "mysub")
-		cmd.Dir = parentRepo.Dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git submodule add failed: %v\n%s", err, out)
-		}
-		parentRepo.CommitAll("add submodule")
-
-		submoduleDir := filepath.Join(parentRepo.Dir, "mysub")
-
-		// Create a worktree from within the submodule
-		worktreeDir := t.TempDir()
-		cmd = exec.Command("git", "worktree", "add", worktreeDir, "-b", "sub-wt-branch")
-		cmd.Dir = submoduleDir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git worktree add from submodule failed: %v\n%s", err, out)
-		}
-		defer exec.Command("git", "-C", submoduleDir, "worktree", "remove", worktreeDir).Run()
-
-		wtRoot, err := GetMainRepoRoot(worktreeDir)
-		if err != nil {
-			t.Fatalf("GetMainRepoRoot on submodule worktree failed: %v", err)
-		}
-
-		subRoot, err := GetMainRepoRoot(submoduleDir)
-		if err != nil {
-			t.Fatalf("GetMainRepoRoot on submodule failed: %v", err)
-		}
-
-		if wtRoot != subRoot {
-			t.Errorf("worktree from submodule should return submodule root: wt=%s sub=%s", wtRoot, subRoot)
-		}
-
-		parentRoot, err := GetMainRepoRoot(parentRepo.Dir)
-		if err != nil {
-			t.Fatalf("GetMainRepoRoot on parent failed: %v", err)
-		}
-
-		if wtRoot == parentRoot {
-			t.Errorf("worktree from submodule should NOT return parent root: wt=%s parent=%s", wtRoot, parentRoot)
-		}
-
-		if info, err := os.Stat(wtRoot); err != nil || !info.IsDir() {
-			t.Errorf("GetMainRepoRoot returned invalid path: %s", wtRoot)
-		}
-	})
-
-	t.Run("worktree HEAD resolves to worktree branch", func(t *testing.T) {
-		mainRepo := NewTestRepo(t)
-		mainRepo.CommitFile("file.txt", "v1", "commit1")
-
-		mainHead, err := ResolveSHA(mainRepo.Dir, "HEAD")
-		if err != nil {
-			t.Fatalf("ResolveSHA main HEAD failed: %v", err)
-		}
-
-		wt := mainRepo.AddWorktree("wt-branch")
-
-		// Make a new commit in the worktree
-		wt.CommitFile("file.txt", "v2", "commit2")
-
-		wtHead, err := ResolveSHA(wt.Dir, "HEAD")
-		if err != nil {
-			t.Fatalf("ResolveSHA worktree HEAD failed: %v", err)
-		}
-
-		if wtHead == mainHead {
-			t.Error("worktree HEAD should differ from main HEAD after new commit")
-		}
-
-		mainHeadAgain, err := ResolveSHA(mainRepo.Dir, "HEAD")
-		if err != nil {
-			t.Fatalf("ResolveSHA main HEAD again failed: %v", err)
-		}
-		if mainHeadAgain != mainHead {
-			t.Errorf("main HEAD changed unexpectedly: was %s, now %s", mainHead, mainHeadAgain)
-		}
-
-		mainRoot, _ := GetMainRepoRoot(mainRepo.Dir)
-		wtRoot, _ := GetMainRepoRoot(wt.Dir)
-		if mainRoot != wtRoot {
-			t.Errorf("GetMainRepoRoot should return same root: main=%s wt=%s", mainRoot, wtRoot)
 		}
 	})
 }

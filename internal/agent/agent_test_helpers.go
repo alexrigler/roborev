@@ -78,6 +78,7 @@ type MockCLIOpts struct {
 	CaptureArgs  bool   // Write "$@" to a capture file
 	CaptureStdin bool   // Write stdin to a capture file
 	StdoutLines  []string
+	StderrLines  []string
 }
 
 // MockCLIResult holds paths to the mock command and any capture files.
@@ -143,15 +144,13 @@ func mockAgentCLI(t *testing.T, opts MockCLIOpts) *MockCLIResult {
 	// Capture args
 	if opts.CaptureArgs {
 		result.ArgsFile = filepath.Join(tmpDir, "args.txt")
-		t.Setenv("MOCK_ARGS_FILE", result.ArgsFile)
-		script.WriteString(`echo "$@" > "$MOCK_ARGS_FILE"` + "\n")
+		fmt.Fprintf(&script, "echo \"$@\" > %q\n", result.ArgsFile)
 	}
 
 	// Capture stdin
 	if opts.CaptureStdin {
 		result.StdinFile = filepath.Join(tmpDir, "stdin.txt")
-		t.Setenv("MOCK_STDIN_FILE", result.StdinFile)
-		script.WriteString(`cat > "$MOCK_STDIN_FILE"` + "\n")
+		fmt.Fprintf(&script, "cat > %q\n", result.StdinFile)
 	}
 
 	// Emit configured stdout lines
@@ -165,6 +164,19 @@ func mockAgentCLI(t *testing.T, opts MockCLIOpts) *MockCLIResult {
 			t.Fatalf("write stdout file: %v", err)
 		}
 		script.WriteString(fmt.Sprintf(`cat %q`, stdoutFile) + "\n")
+	}
+
+	// Emit configured stderr lines
+	if len(opts.StderrLines) > 0 {
+		stderrFile := filepath.Join(tmpDir, "stderr.txt")
+		content := strings.Join(opts.StderrLines, "\n")
+		if !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		if err := os.WriteFile(stderrFile, []byte(content), 0644); err != nil {
+			t.Fatalf("write stderr file: %v", err)
+		}
+		script.WriteString(fmt.Sprintf(`cat %q >&2`, stderrFile) + "\n")
 	}
 
 	script.WriteString("exit " + strings.TrimSpace(fmt.Sprintf("%d", opts.ExitCode)) + "\n")
@@ -246,4 +258,28 @@ type FailingWriter struct {
 
 func (w *FailingWriter) Write(p []byte) (int, error) {
 	return 0, w.Err
+}
+
+// assertFileContent reads the file at path and verifies it matches expected content.
+func assertFileContent(t *testing.T, path, expected string) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", path, err)
+	}
+	if got := strings.TrimSpace(string(content)); got != expected {
+		t.Errorf("file %s content = %q, want %q", path, got, expected)
+	}
+}
+
+// assertFileNotContains reads the file at path and verifies it does NOT contain the unexpected string.
+func assertFileNotContains(t *testing.T, path, unexpected string) {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", path, err)
+	}
+	if strings.Contains(string(content), unexpected) {
+		t.Errorf("file %s contained leaked string: %q", path, unexpected)
+	}
 }

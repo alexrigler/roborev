@@ -8,36 +8,59 @@ import (
 	"testing"
 )
 
-func TestDroidBuildArgsAgenticMode(t *testing.T) {
-	a := NewDroidAgent("droid")
+func TestDroidBuildArgs(t *testing.T) {
+	tests := []struct {
+		name      string
+		agentic   bool
+		reasoning ReasoningLevel
+		wantArgs  []string
+		dontWant  []string
+	}{
+		{
+			name:     "Non-agentic default",
+			agentic:  false,
+			wantArgs: []string{"--auto", "low"},
+			dontWant: []string{"medium"},
+		},
+		{
+			name:     "Agentic mode",
+			agentic:  true,
+			wantArgs: []string{"--auto", "medium"},
+		},
+		{
+			name:      "Reasoning Thorough",
+			reasoning: ReasoningThorough,
+			wantArgs:  []string{"--reasoning-effort", "high"},
+		},
+		{
+			name:      "Reasoning Fast",
+			reasoning: ReasoningFast,
+			wantArgs:  []string{"--reasoning-effort", "low"},
+		},
+		{
+			name:      "Reasoning Standard",
+			reasoning: ReasoningStandard,
+			dontWant:  []string{"--reasoning-effort"},
+		},
+	}
 
-	// Test non-agentic mode (--auto low)
-	args := a.buildArgs(false)
-	assertContainsArg(t, args, "low")
-	assertNotContainsArg(t, args, "medium")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := NewDroidAgent("droid")
+			if tt.reasoning != "" {
+				a = a.WithReasoning(tt.reasoning).(*DroidAgent)
+			}
 
-	// Test agentic mode (--auto medium)
-	args = a.buildArgs(true)
-	assertContainsArg(t, args, "medium")
-}
+			args := a.buildArgs(tt.agentic)
 
-func TestDroidBuildArgsReasoningEffort(t *testing.T) {
-	// Test thorough reasoning
-	a := NewDroidAgent("droid").WithReasoning(ReasoningThorough).(*DroidAgent)
-	args := a.buildArgs(false)
-	assertContainsArg(t, args, "--reasoning-effort")
-	assertContainsArg(t, args, "high")
-
-	// Test fast reasoning
-	a = NewDroidAgent("droid").WithReasoning(ReasoningFast).(*DroidAgent)
-	args = a.buildArgs(false)
-	assertContainsArg(t, args, "--reasoning-effort")
-	assertContainsArg(t, args, "low")
-
-	// Test standard reasoning (no flag)
-	a = NewDroidAgent("droid").WithReasoning(ReasoningStandard).(*DroidAgent)
-	args = a.buildArgs(false)
-	assertNotContainsArg(t, args, "--reasoning-effort")
+			for _, want := range tt.wantArgs {
+				assertContainsArg(t, args, want)
+			}
+			for _, dont := range tt.dontWant {
+				assertNotContainsArg(t, args, dont)
+			}
+		})
+	}
 }
 
 func TestDroidName(t *testing.T) {
@@ -99,10 +122,15 @@ func TestDroidReviewEmptyOutput(t *testing.T) {
 }
 
 func TestDroidReviewWithProgress(t *testing.T) {
+	skipIfWindows(t)
 	tmpDir := t.TempDir()
 	progressFile := filepath.Join(tmpDir, "progress.txt")
 
-	a := newMockDroidAgent(t, "#!/bin/sh\necho \"Processing...\" >&2\necho \"Done\"\n")
+	mock := mockAgentCLI(t, MockCLIOpts{
+		StderrLines: []string{"Processing..."},
+		StdoutLines: []string{"Done"},
+	})
+	a := NewDroidAgent(mock.CmdPath)
 
 	f, err := os.Create(progressFile)
 	if err != nil {
@@ -139,36 +167,27 @@ func TestDroidReviewPipesPromptViaStdin(t *testing.T) {
 		t.Fatalf("Review failed: %v", err)
 	}
 
-	stdin, err := os.ReadFile(mock.StdinFile)
-	if err != nil {
-		t.Fatalf("read stdin capture: %v", err)
-	}
-	if strings.TrimSpace(string(stdin)) != prompt {
-		t.Errorf("stdin = %q, want %q", string(stdin), prompt)
-	}
+	// Prompt must be in stdin
+	assertFileContent(t, mock.StdinFile, prompt)
 
-	args, err := os.ReadFile(mock.ArgsFile)
-	if err != nil {
-		t.Fatalf("read args capture: %v", err)
-	}
-	if strings.Contains(string(args), prompt) {
-		t.Errorf("prompt leaked into argv: %s", string(args))
-	}
+	// Prompt must not be in argv
+	assertFileNotContains(t, mock.ArgsFile, prompt)
 }
 
 func TestDroidReviewAgenticModeFromGlobal(t *testing.T) {
 	withUnsafeAgents(t, true)
 
-	tmpDir := t.TempDir()
-	argsFile := filepath.Join(tmpDir, "args.txt")
-	t.Setenv("ARGS_FILE", argsFile)
+	mock := mockAgentCLI(t, MockCLIOpts{
+		CaptureArgs: true,
+		StdoutLines: []string{"result"},
+	})
 
-	a := newMockDroidAgent(t, "#!/bin/sh\necho \"$@\" > \"$ARGS_FILE\"\necho \"result\"\n")
-	if _, err := a.Review(context.Background(), tmpDir, "deadbeef", "prompt", nil); err != nil {
+	a := NewDroidAgent(mock.CmdPath)
+	if _, err := a.Review(context.Background(), t.TempDir(), "deadbeef", "prompt", nil); err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	args, err := os.ReadFile(argsFile)
+	args, err := os.ReadFile(mock.ArgsFile)
 	if err != nil {
 		t.Fatalf("read args: %v", err)
 	}

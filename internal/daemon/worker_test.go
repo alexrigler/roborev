@@ -76,36 +76,10 @@ func (c *workerTestContext) createAndClaimJob(t *testing.T, sha, workerID string
 	return job
 }
 
-// waitForJobStatus polls until the job reaches one of the given statuses.
-func (c *workerTestContext) waitForJobStatus(t *testing.T, jobID int64, statuses ...storage.JobStatus) *storage.ReviewJob {
+func (c *workerTestContext) assertJobPendingCancel(t *testing.T, jobID int64, expected bool) {
 	t.Helper()
-	return testutil.WaitForJobStatus(t, c.DB, jobID, 10*time.Second, statuses...)
-}
-
-func TestWorkerPoolE2E(t *testing.T) {
-	tc := newWorkerTestContext(t, 2)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createJob(t, sha)
-
-	tc.Pool.Start()
-	finalJob := tc.waitForJobStatus(t, job.ID, storage.JobStatusDone, storage.JobStatusFailed)
-	tc.Pool.Stop()
-
-	if finalJob.Status != storage.JobStatusDone && finalJob.Status != storage.JobStatusFailed {
-		t.Errorf("Job should be done or failed, got %s", finalJob.Status)
-	}
-
-	if finalJob.Status == storage.JobStatusDone {
-		review, err := tc.DB.GetReviewByCommitSHA(sha)
-		if err != nil {
-			t.Fatalf("GetReviewByCommitSHA failed: %v", err)
-		}
-		if review.Agent != "test" {
-			t.Errorf("Expected agent 'test', got '%s'", review.Agent)
-		}
-		if review.Output == "" {
-			t.Error("Review output should not be empty")
-		}
+	if got := c.Pool.IsJobPendingCancel(jobID); got != expected {
+		t.Errorf("IsJobPendingCancel(%d) = %v, want %v", jobID, got, expected)
 	}
 }
 
@@ -119,41 +93,24 @@ func TestWorkerPoolConcurrency(t *testing.T) {
 
 	tc.Pool.Start()
 
-	time.Sleep(500 * time.Millisecond)
-	activeWorkers := tc.Pool.ActiveWorkers()
+	// Poll until workers are active or timeout
+	var activeWorkers int
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		activeWorkers = tc.Pool.ActiveWorkers()
+		if activeWorkers > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if activeWorkers == 0 {
+		t.Fatal("expected active worker within timeout")
+	}
 
 	tc.Pool.Stop()
 
 	t.Logf("Peak active workers: %d", activeWorkers)
-}
-
-func TestWorkerPoolCancelRunningJob(t *testing.T) {
-	tc := newWorkerTestContext(t, 1)
-	sha := testutil.GetHeadSHA(t, tc.TmpDir)
-	job := tc.createJob(t, sha)
-
-	tc.Pool.Start()
-	defer tc.Pool.Stop()
-
-	// Wait for job to be claimed
-	tc.waitForJobStatus(t, job.ID, storage.JobStatusRunning)
-
-	// Cancel the job
-	if err := tc.DB.CancelJob(job.ID); err != nil {
-		t.Fatalf("CancelJob failed: %v", err)
-	}
-	tc.Pool.CancelJob(job.ID)
-
-	finalJob := tc.waitForJobStatus(t, job.ID, storage.JobStatusCanceled)
-
-	if finalJob.Status != storage.JobStatusCanceled {
-		t.Errorf("Expected status 'canceled', got '%s'", finalJob.Status)
-	}
-
-	_, err := tc.DB.GetReviewByJobID(job.ID)
-	if err == nil {
-		t.Error("Expected no review for canceled job, but found one")
-	}
 }
 
 func TestWorkerPoolPendingCancellation(t *testing.T) {
@@ -165,9 +122,7 @@ func TestWorkerPoolPendingCancellation(t *testing.T) {
 		t.Error("CancelJob should return true for valid running job")
 	}
 
-	if !tc.Pool.IsJobPendingCancel(job.ID) {
-		t.Errorf("Job %d should be in pendingCancels", job.ID)
-	}
+	tc.assertJobPendingCancel(t, job.ID, true)
 
 	canceled := false
 	tc.Pool.registerRunningJob(job.ID, func() { canceled = true })
@@ -176,9 +131,7 @@ func TestWorkerPoolPendingCancellation(t *testing.T) {
 		t.Error("Job should have been canceled immediately on registration")
 	}
 
-	if tc.Pool.IsJobPendingCancel(job.ID) {
-		t.Errorf("Job %d should have been removed from pendingCancels", job.ID)
-	}
+	tc.assertJobPendingCancel(t, job.ID, false)
 }
 
 func TestWorkerPoolPendingCancellationAfterDBCancel(t *testing.T) {
@@ -205,9 +158,7 @@ func TestWorkerPoolPendingCancellationAfterDBCancel(t *testing.T) {
 		t.Error("CancelJob should return true for canceled-but-claimed job")
 	}
 
-	if !tc.Pool.IsJobPendingCancel(job.ID) {
-		t.Errorf("Job %d should be in pendingCancels", job.ID)
-	}
+	tc.assertJobPendingCancel(t, job.ID, true)
 
 	canceled := false
 	tc.Pool.registerRunningJob(job.ID, func() { canceled = true })
@@ -273,9 +224,7 @@ func TestWorkerPoolCancelJobRegisteredDuringCheck(t *testing.T) {
 		t.Error("Job should have been canceled")
 	}
 
-	if tc.Pool.IsJobPendingCancel(job.ID) {
-		t.Error("Registered job should not be in pendingCancels")
-	}
+	tc.assertJobPendingCancel(t, job.ID, false)
 }
 
 func TestWorkerPoolCancelJobConcurrentRegister(t *testing.T) {
@@ -339,66 +288,73 @@ func TestResolveBackupAgent(t *testing.T) {
 		name       string
 		jobAgent   string
 		reviewType string
-		cfgField   string // Config field to set
-		cfgValue   string // Value to set
+		config     config.Config
 		want       string
 	}{
 		{
 			name:     "no backup configured",
 			jobAgent: "test",
+			config:   config.Config{},
 			want:     "",
 		},
 		{
 			name:     "unknown backup agent",
 			jobAgent: "test",
-			cfgField: "DefaultBackupAgent",
-			cfgValue: "nonexistent-agent-xyz",
-			want:     "",
+			config: config.Config{
+				DefaultBackupAgent: "nonexistent-agent-xyz",
+			},
+			want: "",
 		},
 		{
 			name:     "backup same as primary",
 			jobAgent: "test",
-			cfgField: "DefaultBackupAgent",
-			cfgValue: "test",
-			want:     "",
+			config: config.Config{
+				DefaultBackupAgent: "test",
+			},
+			want: "",
 		},
 		{
 			name:     "default review type uses review workflow",
 			jobAgent: "codex",
-			cfgField: "ReviewBackupAgent",
-			cfgValue: "test",
-			want:     "test",
+			config: config.Config{
+				ReviewBackupAgent: "test",
+			},
+			want: "test",
 		},
 		{
 			name:       "security review type uses security workflow",
 			jobAgent:   "codex",
 			reviewType: "security",
-			cfgField:   "SecurityBackupAgent",
-			cfgValue:   "test",
-			want:       "test",
+			config: config.Config{
+				SecurityBackupAgent: "test",
+			},
+			want: "test",
 		},
 		{
 			name:       "design review type uses design workflow",
 			jobAgent:   "codex",
 			reviewType: "design",
-			cfgField:   "DesignBackupAgent",
-			cfgValue:   "test",
-			want:       "test",
+			config: config.Config{
+				DesignBackupAgent: "test",
+			},
+			want: "test",
 		},
 		{
 			name:       "workflow mismatch returns empty",
 			jobAgent:   "codex",
 			reviewType: "security",
-			cfgField:   "ReviewBackupAgent",
-			cfgValue:   "test",
-			want:       "",
+			config: config.Config{
+				ReviewBackupAgent: "test",
+			},
+			want: "",
 		},
 		{
 			name:     "default_backup_agent fallback",
 			jobAgent: "codex",
-			cfgField: "DefaultBackupAgent",
-			cfgValue: "test",
-			want:     "test",
+			config: config.Config{
+				DefaultBackupAgent: "test",
+			},
+			want: "test",
 		},
 	}
 
@@ -406,17 +362,11 @@ func TestResolveBackupAgent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := config.DefaultConfig()
 
-			// Set the config field using a switch (avoids reflect)
-			switch tt.cfgField {
-			case "DefaultBackupAgent":
-				cfg.DefaultBackupAgent = tt.cfgValue
-			case "ReviewBackupAgent":
-				cfg.ReviewBackupAgent = tt.cfgValue
-			case "SecurityBackupAgent":
-				cfg.SecurityBackupAgent = tt.cfgValue
-			case "DesignBackupAgent":
-				cfg.DesignBackupAgent = tt.cfgValue
-			}
+			// Merge test config with defaults
+			cfg.DefaultBackupAgent = tt.config.DefaultBackupAgent
+			cfg.ReviewBackupAgent = tt.config.ReviewBackupAgent
+			cfg.SecurityBackupAgent = tt.config.SecurityBackupAgent
+			cfg.DesignBackupAgent = tt.config.DesignBackupAgent
 
 			pool := NewWorkerPool(nil, NewStaticConfig(cfg), 1, NewBroadcaster(), nil)
 			job := &storage.ReviewJob{

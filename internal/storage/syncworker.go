@@ -14,15 +14,16 @@ import (
 
 // SyncWorker handles background synchronization between SQLite and PostgreSQL
 type SyncWorker struct {
-	db        *DB
-	cfg       config.SyncConfig
-	pgPool    *PgPool
-	stopCh    chan struct{}
-	doneCh    chan struct{}
-	mu        sync.Mutex // protects running and pgPool
-	syncMu    sync.Mutex // serializes sync operations (doSync, SyncNow, FinalPush)
-	connectMu sync.Mutex // serializes connect operations
-	running   bool
+	db              *DB
+	cfg             config.SyncConfig
+	pgPool          *PgPool
+	stopCh          chan struct{}
+	doneCh          chan struct{}
+	mu              sync.Mutex // protects running and pgPool
+	syncMu          sync.Mutex // serializes sync operations (doSync, SyncNow, FinalPush)
+	connectMu       sync.Mutex // serializes connect operations
+	running         bool
+	skipInitialSync bool // when true, skip the immediate doSync on connect
 }
 
 // NewSyncWorker creates a new sync worker
@@ -33,6 +34,18 @@ func NewSyncWorker(db *DB, cfg config.SyncConfig) *SyncWorker {
 		stopCh: make(chan struct{}),
 		doneCh: make(chan struct{}),
 	}
+}
+
+// SetSkipInitialSync disables the immediate doSync that normally
+// runs right after connecting. Must be called before Start().
+func (w *SyncWorker) SetSkipInitialSync(skip bool) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.running {
+		return fmt.Errorf("cannot set skipInitialSync after Start()")
+	}
+	w.skipInitialSync = skip
+	return nil
 }
 
 // Start begins the sync worker in a background goroutine.
@@ -68,10 +81,13 @@ func (w *SyncWorker) Start() error {
 	w.doneCh = doneCh
 
 	w.running = true
+	// Snapshot skipInitialSync under lock so the goroutine reads
+	// an immutable copy — no race with a hypothetical late setter.
+	skipSync := w.skipInitialSync
 	// Pass channels as parameters to avoid data races if Start() is called
 	// again while the goroutine is still running (which shouldn't happen,
 	// but this makes it safe regardless)
-	go w.run(stopCh, doneCh, interval, connectTimeout)
+	go w.run(stopCh, doneCh, interval, connectTimeout, skipSync)
 	return nil
 }
 
@@ -311,7 +327,7 @@ type pushPullStats struct {
 }
 
 // run is the main sync loop
-func (w *SyncWorker) run(stopCh, doneCh chan struct{}, interval, connectTimeout time.Duration) {
+func (w *SyncWorker) run(stopCh, doneCh chan struct{}, interval, connectTimeout time.Duration, skipInitialSync bool) {
 	defer close(doneCh)
 
 	// Initial connection attempt with backoff
@@ -346,7 +362,8 @@ func (w *SyncWorker) run(stopCh, doneCh chan struct{}, interval, connectTimeout 
 
 		// Run sync loop until disconnection or stop
 		// Only do initial sync if we made the connection (not if SyncNow connected for us)
-		w.syncLoop(stopCh, interval, newConn)
+		// and skipInitialSync is not set
+		w.syncLoop(stopCh, interval, newConn && !skipInitialSync)
 
 		// If we get here, we disconnected - try to reconnect
 		w.mu.Lock()
