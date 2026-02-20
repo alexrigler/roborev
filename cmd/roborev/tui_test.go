@@ -1442,3 +1442,190 @@ func TestTUIStatusDisplaysCorrectly(t *testing.T) {
 		}
 	}
 }
+
+func TestPatchFiles(t *testing.T) {
+	tests := []struct {
+		name  string
+		patch string
+		want  []string
+	}{
+		{
+			name: "simple add",
+			patch: `diff --git a/main.go b/main.go
+--- a/main.go
++++ b/main.go
+@@ -1 +1,2 @@
+ package main
++// new line
+`,
+			want: []string{"main.go"},
+		},
+		{
+			name: "file in b/ directory not double-stripped",
+			patch: `diff --git a/b/main.go b/b/main.go
+--- a/b/main.go
++++ b/b/main.go
+@@ -1 +1,2 @@
+ package main
++// new line
+`,
+			want: []string{"b/main.go"},
+		},
+		{
+			name: "file in a/ directory not double-stripped",
+			patch: `diff --git a/a/utils.go b/a/utils.go
+--- a/a/utils.go
++++ b/a/utils.go
+@@ -1 +1,2 @@
+ package a
++// new line
+`,
+			want: []string{"a/utils.go"},
+		},
+		{
+			name: "new file with /dev/null",
+			patch: `diff --git a/new.go b/new.go
+--- /dev/null
++++ b/new.go
+@@ -0,0 +1 @@
++package main
+`,
+			want: []string{"new.go"},
+		},
+		{
+			name: "deleted file with /dev/null",
+			patch: `diff --git a/old.go b/old.go
+--- a/old.go
++++ /dev/null
+@@ -1 +0,0 @@
+-package main
+`,
+			want: []string{"old.go"},
+		},
+		{
+			name: "rename",
+			patch: `diff --git a/old.go b/renamed.go
+--- a/old.go
++++ b/renamed.go
+@@ -1 +1 @@
+-package old
++package renamed
+`,
+			want: []string{"old.go", "renamed.go"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := patchFiles(tt.patch)
+			if err != nil {
+				t.Fatalf("patchFiles returned error: %v", err)
+			}
+			wantSet := map[string]bool{}
+			for _, f := range tt.want {
+				wantSet[f] = true
+			}
+			if len(got) != len(tt.want) {
+				t.Errorf("expected %d files, got %d: %v", len(tt.want), len(got), got)
+			}
+			gotSet := map[string]bool{}
+			for _, f := range got {
+				if gotSet[f] {
+					t.Errorf("duplicate file in output: %q", f)
+				}
+				gotSet[f] = true
+			}
+			for f := range wantSet {
+				if !gotSet[f] {
+					t.Errorf("missing expected file %q", f)
+				}
+			}
+			for f := range gotSet {
+				if !wantSet[f] {
+					t.Errorf("unexpected file %q", f)
+				}
+			}
+		})
+	}
+}
+
+func TestDirtyPatchFilesError(t *testing.T) {
+	// dirtyPatchFiles should return an error when git diff fails
+	// (e.g., invalid repo path), not silently return nil.
+	_, err := dirtyPatchFiles("/nonexistent/repo/path", []string{"file.go"})
+	if err == nil {
+		t.Fatal("expected error from dirtyPatchFiles with invalid repo, got nil")
+	}
+	if !strings.Contains(err.Error(), "git diff") {
+		t.Errorf("expected error to mention 'git diff', got: %v", err)
+	}
+}
+
+func TestTUIFixTriggerResultMsg(t *testing.T) {
+	t.Run("warning shows flash and triggers refresh", func(t *testing.T) {
+		m := newTuiModel("http://localhost")
+		m.currentView = tuiViewTasks
+		m.width = 80
+		m.height = 24
+
+		msg := tuiFixTriggerResultMsg{
+			job:     &storage.ReviewJob{ID: 42},
+			warning: "rebase job #42 enqueued but failed to mark #10 as rebased: server error",
+		}
+
+		result, cmd := m.Update(msg)
+		updated := result.(tuiModel)
+
+		if !strings.Contains(updated.flashMessage, "failed to mark") {
+			t.Errorf("expected warning in flash, got %q", updated.flashMessage)
+		}
+		if updated.flashView != tuiViewTasks {
+			t.Errorf("expected flash view tasks, got %v", updated.flashView)
+		}
+		if cmd == nil {
+			t.Error("expected refresh cmd, got nil")
+		}
+	})
+
+	t.Run("success shows enqueued flash and triggers refresh", func(t *testing.T) {
+		m := newTuiModel("http://localhost")
+		m.currentView = tuiViewTasks
+		m.width = 80
+		m.height = 24
+
+		msg := tuiFixTriggerResultMsg{
+			job: &storage.ReviewJob{ID: 99},
+		}
+
+		result, cmd := m.Update(msg)
+		updated := result.(tuiModel)
+
+		if !strings.Contains(updated.flashMessage, "#99 enqueued") {
+			t.Errorf("expected enqueued flash, got %q", updated.flashMessage)
+		}
+		if cmd == nil {
+			t.Error("expected refresh cmd, got nil")
+		}
+	})
+
+	t.Run("error shows failure flash with no refresh", func(t *testing.T) {
+		m := newTuiModel("http://localhost")
+		m.currentView = tuiViewTasks
+		m.width = 80
+		m.height = 24
+
+		msg := tuiFixTriggerResultMsg{
+			err: fmt.Errorf("connection refused"),
+		}
+
+		result, cmd := m.Update(msg)
+		updated := result.(tuiModel)
+
+		if !strings.Contains(updated.flashMessage, "Fix failed") {
+			t.Errorf("expected failure flash, got %q", updated.flashMessage)
+		}
+		if cmd != nil {
+			t.Error("expected no cmd on error, got non-nil")
+		}
+	})
+}

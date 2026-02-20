@@ -13,6 +13,7 @@ import (
 	"github.com/roborev-dev/roborev/internal/config"
 	"github.com/roborev-dev/roborev/internal/prompt"
 	"github.com/roborev-dev/roborev/internal/storage"
+	"github.com/roborev-dev/roborev/internal/worktree"
 )
 
 // WorkerPool manages a pool of review workers
@@ -66,8 +67,8 @@ func NewWorkerPool(db *storage.DB, cfgGetter ConfigGetter, numWorkers int, broad
 func (wp *WorkerPool) Start() {
 	log.Printf("Starting worker pool with %d workers", wp.numWorkers)
 
+	wp.wg.Add(wp.numWorkers)
 	for i := 0; i < wp.numWorkers; i++ {
-		wp.wg.Add(1)
 		go wp.worker(i)
 	}
 }
@@ -300,7 +301,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	// Build the prompt (or use pre-stored prompt for task/compact jobs)
 	var reviewPrompt string
 	var err error
-	if job.IsPromptJob() && job.Prompt != "" {
+	if job.UsesStoredPrompt() && job.Prompt != "" {
 		// Prompt-native job (task, compact) — prepend agent-specific preamble
 		preamble := prompt.GetSystemPrompt(job.Agent, "run")
 		if preamble != "" {
@@ -308,7 +309,7 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		} else {
 			reviewPrompt = job.Prompt
 		}
-	} else if job.IsPromptJob() {
+	} else if job.UsesStoredPrompt() {
 		// Prompt-native job (task/compact) with missing prompt — likely a
 		// daemon version mismatch or storage issue. Fail clearly instead
 		// of trying to build a prompt from a non-git label.
@@ -373,9 +374,26 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		wp.outputBuffers.CloseJob(job.ID)
 	}()
 
+	// For fix jobs, create an isolated worktree to run the agent in.
+	// The agent modifies files in the worktree; afterwards we capture the diff as a patch.
+	reviewRepoPath := job.RepoPath
+	var fixWorktree *worktree.Worktree
+	if job.IsFixJob() {
+		wt, wtErr := worktree.Create(job.RepoPath)
+		if wtErr != nil {
+			log.Printf("[%s] Error creating worktree for fix job %d: %v", workerID, job.ID, wtErr)
+			wp.failOrRetry(workerID, job, agentName, fmt.Sprintf("create worktree: %v", wtErr))
+			return
+		}
+		defer wt.Close()
+		fixWorktree = wt
+		reviewRepoPath = wt.Dir
+		log.Printf("[%s] Fix job %d: running agent in worktree %s", workerID, job.ID, wt.Dir)
+	}
+
 	// Run the review
 	log.Printf("[%s] Running %s review...", workerID, agentName)
-	output, err := a.Review(ctx, job.RepoPath, job.GitRef, reviewPrompt, outputWriter)
+	output, err := a.Review(ctx, reviewRepoPath, job.GitRef, reviewPrompt, outputWriter)
 	if err != nil {
 		// Check if this was a cancellation
 		if ctx.Err() == context.Canceled {
@@ -397,6 +415,25 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 		return
 	}
 
+	// For fix jobs, capture the patch from the worktree. Patch capture
+	// failures are fatal — a fix job without a patch is useless.
+	var fixPatch string
+	if job.IsFixJob() {
+		var patchErr error
+		fixPatch, patchErr = fixWorktree.CapturePatch()
+		if patchErr != nil {
+			log.Printf("[%s] Fix job %d: patch capture failed: %v", workerID, job.ID, patchErr)
+			wp.failOrRetry(workerID, job, agentName, fmt.Sprintf("patch capture: %v", patchErr))
+			return
+		}
+		if fixPatch == "" {
+			log.Printf("[%s] Fix job %d: agent produced no file changes", workerID, job.ID)
+			wp.failOrRetry(workerID, job, agentName, "agent produced no file changes")
+			return
+		}
+		log.Printf("[%s] Fix job %d: captured patch (%d bytes)", workerID, job.ID, len(fixPatch))
+	}
+
 	// For compact jobs, validate raw agent output before storing.
 	// Invalid output (empty, error patterns) should fail the job,
 	// not produce a "done" review that misleads --wait callers.
@@ -407,9 +444,14 @@ func (wp *WorkerPool) processJob(workerID string, job *storage.ReviewJob) {
 	}
 
 	// Store the result (use actual agent name, not requested).
-	// CompleteJob is a no-op (returns nil) if the job was canceled
-	// between agent finish and now.
-	if err := wp.db.CompleteJob(job.ID, agentName, reviewPrompt, output); err != nil {
+	// CompleteJob/CompleteFixJob is a no-op (returns nil) if the job was
+	// canceled between agent finish and now.
+	if job.IsFixJob() {
+		if err := wp.db.CompleteFixJob(job.ID, agentName, reviewPrompt, output, fixPatch); err != nil {
+			log.Printf("[%s] Error storing fix review: %v", workerID, err)
+			return
+		}
+	} else if err := wp.db.CompleteJob(job.ID, agentName, reviewPrompt, output); err != nil {
 		log.Printf("[%s] Error storing review: %v", workerID, err)
 		return
 	}

@@ -695,7 +695,7 @@ func TestJobCounts(t *testing.T) {
 		db.FailJob(claimed2.ID, "", "err")
 	}
 
-	queued, running, done, failed, _, err := db.GetJobCounts()
+	queued, running, done, failed, _, _, _, err := db.GetJobCounts()
 	if err != nil {
 		t.Fatalf("GetJobCounts failed: %v", err)
 	}
@@ -1212,12 +1212,112 @@ func TestCancelJob(t *testing.T) {
 		_, _, job := createJobChain(t, db, "/tmp/test-repo", "cancel-count")
 		db.CancelJob(job.ID)
 
-		_, _, _, _, canceled, err := db.GetJobCounts()
+		_, _, _, _, canceled, _, _, err := db.GetJobCounts()
 		if err != nil {
 			t.Fatalf("GetJobCounts failed: %v", err)
 		}
 		if canceled < 1 {
 			t.Errorf("Expected at least 1 canceled job, got %d", canceled)
+		}
+	})
+}
+
+func TestMarkJobApplied(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo, _ := db.GetOrCreateRepo("/tmp/test-repo")
+	commit, _ := db.GetOrCreateCommit(repo.ID, "applied-test", "A", "S", time.Now())
+
+	t.Run("mark done fix job as applied", func(t *testing.T) {
+		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "applied-test", Agent: "codex", JobType: JobTypeFix, ParentJobID: 1})
+		db.ClaimJob("worker-1")
+		db.CompleteJob(job.ID, "codex", "prompt", "output")
+
+		err := db.MarkJobApplied(job.ID)
+		if err != nil {
+			t.Fatalf("MarkJobApplied failed: %v", err)
+		}
+
+		updated, _ := db.GetJobByID(job.ID)
+		if updated.Status != JobStatusApplied {
+			t.Errorf("Expected status 'applied', got '%s'", updated.Status)
+		}
+	})
+
+	t.Run("mark non-done job fails", func(t *testing.T) {
+		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "applied-test-q", Agent: "codex", JobType: JobTypeFix, ParentJobID: 1})
+
+		err := db.MarkJobApplied(job.ID)
+		if err == nil {
+			t.Error("MarkJobApplied should fail for queued jobs")
+		}
+	})
+
+	t.Run("mark applied job again fails", func(t *testing.T) {
+		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "applied-test-2", Agent: "codex", JobType: JobTypeFix, ParentJobID: 1})
+		db.ClaimJob("worker-1")
+		db.CompleteJob(job.ID, "codex", "prompt", "output")
+		db.MarkJobApplied(job.ID)
+
+		err := db.MarkJobApplied(job.ID)
+		if err == nil {
+			t.Error("MarkJobApplied should fail for already-applied jobs")
+		}
+	})
+
+	t.Run("mark non-fix job fails", func(t *testing.T) {
+		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "applied-review", Agent: "codex"})
+		db.ClaimJob("worker-1")
+		db.CompleteJob(job.ID, "codex", "prompt", "output")
+
+		err := db.MarkJobApplied(job.ID)
+		if err == nil {
+			t.Error("MarkJobApplied should fail for non-fix jobs")
+		}
+	})
+}
+
+func TestMarkJobRebased(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo, _ := db.GetOrCreateRepo("/tmp/test-repo")
+	commit, _ := db.GetOrCreateCommit(repo.ID, "rebased-test", "A", "S", time.Now())
+
+	t.Run("mark done fix job as rebased", func(t *testing.T) {
+		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "rebased-test", Agent: "codex", JobType: JobTypeFix, ParentJobID: 1})
+		db.ClaimJob("worker-1")
+		db.CompleteJob(job.ID, "codex", "prompt", "output")
+
+		err := db.MarkJobRebased(job.ID)
+		if err != nil {
+			t.Fatalf("MarkJobRebased failed: %v", err)
+		}
+
+		updated, _ := db.GetJobByID(job.ID)
+		if updated.Status != JobStatusRebased {
+			t.Errorf("Expected status 'rebased', got '%s'", updated.Status)
+		}
+	})
+
+	t.Run("mark non-done job fails", func(t *testing.T) {
+		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "rebased-test-q", Agent: "codex", JobType: JobTypeFix, ParentJobID: 1})
+
+		err := db.MarkJobRebased(job.ID)
+		if err == nil {
+			t.Error("MarkJobRebased should fail for queued jobs")
+		}
+	})
+
+	t.Run("mark non-fix job fails", func(t *testing.T) {
+		job, _ := db.EnqueueJob(EnqueueOpts{RepoID: repo.ID, CommitID: commit.ID, GitRef: "rebased-review", Agent: "codex"})
+		db.ClaimJob("worker-1")
+		db.CompleteJob(job.ID, "codex", "prompt", "output")
+
+		err := db.MarkJobRebased(job.ID)
+		if err == nil {
+			t.Error("MarkJobRebased should fail for non-fix jobs")
 		}
 	})
 }
@@ -1352,6 +1452,24 @@ func TestMigrationFromOldSchema(t *testing.T) {
 	}
 	if status != "canceled" {
 		t.Errorf("Expected status 'canceled', got '%s'", status)
+	}
+
+	// Verify 'applied' and 'rebased' statuses work after migration
+	_, err = db.Exec(`UPDATE review_jobs SET status = 'done' WHERE id = ?`, jobID)
+	if err != nil {
+		t.Fatalf("Failed to set done status: %v", err)
+	}
+	_, err = db.Exec(`UPDATE review_jobs SET status = 'applied' WHERE id = ?`, jobID)
+	if err != nil {
+		t.Fatalf("Setting applied status failed after migration: %v", err)
+	}
+	_, err = db.Exec(`UPDATE review_jobs SET status = 'done' WHERE id = ?`, jobID)
+	if err != nil {
+		t.Fatalf("Failed to reset to done: %v", err)
+	}
+	_, err = db.Exec(`UPDATE review_jobs SET status = 'rebased' WHERE id = ?`, jobID)
+	if err != nil {
+		t.Fatalf("Setting rebased status failed after migration: %v", err)
 	}
 
 	// Verify constraint still rejects invalid status
@@ -3168,4 +3286,100 @@ func createJobChain(t *testing.T, db *DB, repoPath, sha string) (*Repo, *Commit,
 	commit := createCommit(t, db, repo.ID, sha)
 	job := enqueueJob(t, db, repo.ID, commit.ID, sha)
 	return repo, commit, job
+}
+
+func TestListJobsWithJobTypeFilter(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	repo := createRepo(t, db, "/tmp/repo-jobtype")
+	commit := createCommit(t, db, repo.ID, "jt-sha")
+
+	// Create a review job (default type)
+	reviewJob := enqueueJob(t, db, repo.ID, commit.ID, "jt-sha")
+
+	// Create a fix job parented to the review
+	_, err := db.EnqueueJob(EnqueueOpts{
+		RepoID:      repo.ID,
+		CommitID:    commit.ID,
+		GitRef:      "jt-sha",
+		Agent:       "codex",
+		JobType:     JobTypeFix,
+		ParentJobID: reviewJob.ID,
+	})
+	if err != nil {
+		t.Fatalf("EnqueueJob fix failed: %v", err)
+	}
+
+	t.Run("filter by fix returns only fix jobs", func(t *testing.T) {
+		jobs, err := db.ListJobs("", "", 50, 0, WithJobType("fix"))
+		if err != nil {
+			t.Fatalf("ListJobs failed: %v", err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("Expected 1 fix job, got %d", len(jobs))
+		}
+		if jobs[0].JobType != JobTypeFix {
+			t.Errorf("Expected job_type 'fix', got %q", jobs[0].JobType)
+		}
+	})
+
+	t.Run("filter by review returns only review jobs", func(t *testing.T) {
+		jobs, err := db.ListJobs("", "", 50, 0, WithJobType("review"))
+		if err != nil {
+			t.Fatalf("ListJobs failed: %v", err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("Expected 1 review job, got %d", len(jobs))
+		}
+		if jobs[0].JobType != JobTypeReview {
+			t.Errorf("Expected job_type 'review', got %q", jobs[0].JobType)
+		}
+	})
+
+	t.Run("no filter returns all jobs", func(t *testing.T) {
+		jobs, err := db.ListJobs("", "", 50, 0)
+		if err != nil {
+			t.Fatalf("ListJobs failed: %v", err)
+		}
+		if len(jobs) != 2 {
+			t.Errorf("Expected 2 jobs with no filter, got %d", len(jobs))
+		}
+	})
+
+	t.Run("nonexistent type returns empty", func(t *testing.T) {
+		jobs, err := db.ListJobs("", "", 50, 0, WithJobType("nonexistent"))
+		if err != nil {
+			t.Fatalf("ListJobs failed: %v", err)
+		}
+		if len(jobs) != 0 {
+			t.Errorf("Expected 0 jobs for nonexistent type, got %d", len(jobs))
+		}
+	})
+
+	t.Run("exclude fix returns only non-fix jobs", func(t *testing.T) {
+		jobs, err := db.ListJobs("", "", 50, 0, WithExcludeJobType("fix"))
+		if err != nil {
+			t.Fatalf("ListJobs failed: %v", err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("Expected 1 non-fix job, got %d", len(jobs))
+		}
+		if jobs[0].JobType == JobTypeFix {
+			t.Error("Expected non-fix job, got fix")
+		}
+	})
+
+	t.Run("exclude review returns only non-review jobs", func(t *testing.T) {
+		jobs, err := db.ListJobs("", "", 50, 0, WithExcludeJobType("review"))
+		if err != nil {
+			t.Fatalf("ListJobs failed: %v", err)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("Expected 1 non-review job, got %d", len(jobs))
+		}
+		if jobs[0].JobType != JobTypeFix {
+			t.Errorf("Expected fix job, got %q", jobs[0].JobType)
+		}
+	})
 }

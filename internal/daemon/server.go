@@ -89,6 +89,10 @@ func NewServer(db *storage.DB, cfg *config.Config, configPath string) *Server {
 	mux.HandleFunc("/api/remap", s.handleRemap)
 	mux.HandleFunc("/api/sync/now", s.handleSyncNow)
 	mux.HandleFunc("/api/sync/status", s.handleSyncStatus)
+	mux.HandleFunc("/api/job/fix", s.handleFixJob)
+	mux.HandleFunc("/api/job/patch", s.handleGetPatch)
+	mux.HandleFunc("/api/job/applied", s.handleMarkJobApplied)
+	mux.HandleFunc("/api/job/rebased", s.handleMarkJobRebased)
 
 	s.httpServer = &http.Server{
 		Addr:    cfg.ServerAddr,
@@ -725,6 +729,7 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("database error: %v", err))
 			return
 		}
+		job.Patch = nil // Patch is only served via /api/job/patch
 		writeJSON(w, map[string]any{
 			"jobs":     []storage.ReviewJob{*job},
 			"has_more": false,
@@ -783,6 +788,12 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	if addrStr := r.URL.Query().Get("addressed"); addrStr == "true" || addrStr == "false" {
 		listOpts = append(listOpts, storage.WithAddressed(addrStr == "true"))
+	}
+	if jobType := r.URL.Query().Get("job_type"); jobType != "" {
+		listOpts = append(listOpts, storage.WithJobType(jobType))
+	}
+	if exJobType := r.URL.Query().Get("exclude_job_type"); exJobType != "" {
+		listOpts = append(listOpts, storage.WithExcludeJobType(exJobType))
 	}
 
 	jobs, err := s.db.ListJobs(status, repo, fetchLimit, offset, listOpts...)
@@ -1316,7 +1327,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	queued, running, done, failed, canceled, err := s.db.GetJobCounts()
+	queued, running, done, failed, canceled, applied, rebased, err := s.db.GetJobCounts()
 	if err != nil {
 		s.writeInternalError(w, fmt.Sprintf("get counts: %v", err))
 		return
@@ -1336,6 +1347,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		CompletedJobs:       done,
 		FailedJobs:          failed,
 		CanceledJobs:        canceled,
+		AppliedJobs:         applied,
+		RebasedJobs:         rebased,
 		ActiveWorkers:       s.workerPool.ActiveWorkers(),
 		MaxWorkers:          s.workerPool.MaxWorkers(),
 		MachineID:           s.getMachineID(),
@@ -1622,6 +1635,249 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, status)
+}
+
+// handleFixJob creates a background fix job for a review.
+// It fetches the parent review, builds a fix prompt, and enqueues a new
+// fix job that will run in an isolated worktree.
+func (s *Server) handleFixJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, 50<<20) // 50MB limit
+	var req struct {
+		ParentJobID int64  `json:"parent_job_id"`
+		Prompt      string `json:"prompt,omitempty"`       // Optional custom prompt override
+		StaleJobID  int64  `json:"stale_job_id,omitempty"` // Optional: server looks up patch from this job for rebase
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.ParentJobID == 0 {
+		writeError(w, http.StatusBadRequest, "parent_job_id is required")
+		return
+	}
+
+	// Fetch the parent job — must be a review (not a fix job)
+	parentJob, err := s.db.GetJobByID(req.ParentJobID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "parent job not found")
+		return
+	}
+	if parentJob.IsFixJob() {
+		writeError(w, http.StatusBadRequest, "parent job must be a review, not a fix job")
+		return
+	}
+
+	// Build the fix prompt
+	fixPrompt := req.Prompt
+	if fixPrompt == "" && req.StaleJobID > 0 {
+		// Server-side rebase: look up stale patch from DB and build rebase prompt
+		staleJob, err := s.db.GetJobByID(req.StaleJobID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "stale job not found")
+			return
+		}
+		if staleJob.JobType != storage.JobTypeFix {
+			writeError(w, http.StatusBadRequest, "stale job is not a fix job")
+			return
+		}
+		if staleJob.RepoID != parentJob.RepoID {
+			writeError(w, http.StatusBadRequest, "stale job belongs to a different repo")
+			return
+		}
+		// Verify stale job is linked to the same parent
+		if staleJob.ParentJobID == nil || *staleJob.ParentJobID != req.ParentJobID {
+			writeError(w, http.StatusBadRequest, "stale job is not linked to the specified parent")
+			return
+		}
+		// Require terminal status with a usable patch
+		switch staleJob.Status {
+		case storage.JobStatusDone, storage.JobStatusApplied, storage.JobStatusRebased:
+			// OK
+		default:
+			writeError(w, http.StatusBadRequest, "stale job is not in a terminal state")
+			return
+		}
+		if staleJob.Patch == nil || *staleJob.Patch == "" {
+			writeError(w, http.StatusBadRequest, "stale job has no patch to rebase from")
+			return
+		}
+		fixPrompt = buildRebasePrompt(staleJob.Patch)
+	}
+	if fixPrompt == "" {
+		// Fetch the review output for the parent job
+		review, err := s.db.GetReviewByJobID(req.ParentJobID)
+		if err != nil || review == nil {
+			writeError(w, http.StatusBadRequest, "parent job has no review to fix")
+			return
+		}
+		fixPrompt = buildFixPrompt(review.Output)
+	}
+
+	// Resolve agent for fix workflow
+	cfg := s.configWatcher.Config()
+	reasoning := "standard"
+	agentName := config.ResolveAgentForWorkflow("", parentJob.RepoPath, cfg, "fix", reasoning)
+	if resolved, err := agent.GetAvailable(agentName); err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("no agent available: %v", err))
+		return
+	} else {
+		agentName = resolved.Name()
+	}
+	model := config.ResolveModelForWorkflow("", parentJob.RepoPath, cfg, "fix", reasoning)
+
+	// Enqueue the fix job
+	job, err := s.db.EnqueueJob(storage.EnqueueOpts{
+		RepoID:      parentJob.RepoID,
+		GitRef:      parentJob.GitRef,
+		Branch:      parentJob.Branch,
+		Agent:       agentName,
+		Model:       model,
+		Reasoning:   reasoning,
+		Prompt:      fixPrompt,
+		Agentic:     true,
+		Label:       fmt.Sprintf("fix #%d", req.ParentJobID),
+		JobType:     storage.JobTypeFix,
+		ParentJobID: req.ParentJobID,
+	})
+	if err != nil {
+		s.writeInternalError(w, fmt.Sprintf("enqueue fix job: %v", err))
+		return
+	}
+
+	writeJSONWithStatus(w, http.StatusCreated, job)
+}
+
+// handleGetPatch returns the stored patch for a completed fix job.
+func (s *Server) handleGetPatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	jobIDStr := r.URL.Query().Get("job_id")
+	if jobIDStr == "" {
+		writeError(w, http.StatusBadRequest, "job_id parameter required")
+		return
+	}
+
+	jobID, err := strconv.ParseInt(jobIDStr, 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid job_id")
+		return
+	}
+
+	job, err := s.db.GetJobByID(jobID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	}
+
+	if !job.HasViewableOutput() || job.Patch == nil {
+		writeError(w, http.StatusNotFound, "no patch available for this job")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(*job.Patch))
+}
+
+func (s *Server) handleMarkJobApplied(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req struct {
+		JobID int64 `json:"job_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.JobID == 0 {
+		writeError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+
+	if err := s.db.MarkJobApplied(req.JobID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "job not found or not in done state")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("mark applied: %v", err))
+		return
+	}
+
+	writeJSON(w, map[string]string{"status": "applied"})
+}
+
+func (s *Server) handleMarkJobRebased(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req struct {
+		JobID int64 `json:"job_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.JobID == 0 {
+		writeError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+
+	if err := s.db.MarkJobRebased(req.JobID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "job not found or not in done state")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("mark rebased: %v", err))
+		return
+	}
+
+	writeJSON(w, map[string]string{"status": "rebased"})
+}
+
+// buildFixPrompt constructs a prompt for fixing review findings.
+func buildFixPrompt(reviewOutput string) string {
+	return "# Fix Request\n\n" +
+		"An analysis was performed and produced the following findings:\n\n" +
+		"## Analysis Findings\n\n" +
+		reviewOutput +
+		"\n\n## Instructions\n\n" +
+		"Please apply the suggested changes from the analysis above. " +
+		"Make the necessary edits to address each finding. " +
+		"Focus on the highest priority items first.\n\n" +
+		"After making changes:\n" +
+		"1. Verify the code still compiles/passes linting\n" +
+		"2. Run any relevant tests to ensure nothing is broken\n" +
+		"3. Stage the changes with git add but do NOT commit — the changes will be captured as a patch\n"
+}
+
+// buildRebasePrompt constructs a prompt for re-applying a stale patch to current HEAD.
+func buildRebasePrompt(stalePatch *string) string {
+	prompt := "# Rebase Fix Request\n\n" +
+		"A previous fix attempt produced a patch that no longer applies cleanly to the current HEAD.\n" +
+		"Your task is to achieve the same changes but adapted to the current state of the code.\n\n"
+	if stalePatch != nil && *stalePatch != "" {
+		prompt += "## Previous Patch (stale)\n\n`````diff\n" + *stalePatch + "\n`````\n\n"
+	}
+	prompt += "## Instructions\n\n" +
+		"1. Review the intent of the previous patch\n" +
+		"2. Apply equivalent changes to the current codebase\n" +
+		"3. Resolve any conflicts with recent changes\n" +
+		"4. Verify the code compiles and tests pass\n" +
+		"5. Stage the changes with git add but do NOT commit\n"
+	return prompt
 }
 
 // formatDuration formats a duration in human-readable form (e.g., "2h 15m")

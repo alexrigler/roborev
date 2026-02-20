@@ -1737,7 +1737,7 @@ func TestHandleEnqueueExcludedBranch(t *testing.T) {
 		}
 
 		// Verify no job was created
-		queued, _, _, _, _, _ := db.GetJobCounts()
+		queued, _, _, _, _, _, _, _ := db.GetJobCounts()
 		if queued != 0 {
 			t.Errorf("Expected 0 queued jobs, got %d", queued)
 		}
@@ -1762,7 +1762,7 @@ func TestHandleEnqueueExcludedBranch(t *testing.T) {
 		}
 
 		// Verify job was created
-		queued, _, _, _, _, _ := db.GetJobCounts()
+		queued, _, _, _, _, _, _, _ := db.GetJobCounts()
 		if queued != 1 {
 			t.Errorf("Expected 1 queued job, got %d", queued)
 		}
@@ -3460,4 +3460,333 @@ func TestHandleListCommentsJobIDParsing(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestHandleListJobsJobTypeFilter(t *testing.T) {
+	server, db, tmpDir := newTestServer(t)
+
+	repoDir := filepath.Join(tmpDir, "repo-jt")
+	testutil.InitTestGitRepo(t, repoDir)
+	repo, _ := db.GetOrCreateRepo(repoDir)
+	commit, _ := db.GetOrCreateCommit(
+		repo.ID, "jt-abc", "Author", "Subject", time.Now(),
+	)
+
+	// Create a review job
+	reviewJob, _ := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID:   repo.ID,
+		CommitID: commit.ID,
+		GitRef:   "jt-abc",
+		Agent:    "test",
+	})
+
+	// Create a fix job parented to the review
+	db.EnqueueJob(storage.EnqueueOpts{
+		RepoID:      repo.ID,
+		CommitID:    commit.ID,
+		GitRef:      "jt-abc",
+		Agent:       "test",
+		JobType:     storage.JobTypeFix,
+		ParentJobID: reviewJob.ID,
+	})
+
+	t.Run("job_type=fix returns only fix jobs", func(t *testing.T) {
+		req := httptest.NewRequest(
+			http.MethodGet, "/api/jobs?job_type=fix", nil,
+		)
+		w := httptest.NewRecorder()
+		server.handleListJobs(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp struct {
+			Jobs []storage.ReviewJob `json:"jobs"`
+		}
+		testutil.DecodeJSON(t, w, &resp)
+
+		if len(resp.Jobs) != 1 {
+			t.Fatalf("Expected 1 fix job, got %d", len(resp.Jobs))
+		}
+		if resp.Jobs[0].JobType != storage.JobTypeFix {
+			t.Errorf(
+				"Expected job_type 'fix', got %q", resp.Jobs[0].JobType,
+			)
+		}
+	})
+
+	t.Run("no job_type returns all jobs", func(t *testing.T) {
+		req := httptest.NewRequest(
+			http.MethodGet, "/api/jobs", nil,
+		)
+		w := httptest.NewRecorder()
+		server.handleListJobs(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp struct {
+			Jobs []storage.ReviewJob `json:"jobs"`
+		}
+		testutil.DecodeJSON(t, w, &resp)
+
+		if len(resp.Jobs) != 2 {
+			t.Errorf("Expected 2 jobs total, got %d", len(resp.Jobs))
+		}
+	})
+
+	t.Run("exclude_job_type=fix returns only non-fix jobs", func(t *testing.T) {
+		req := httptest.NewRequest(
+			http.MethodGet, "/api/jobs?exclude_job_type=fix", nil,
+		)
+		w := httptest.NewRecorder()
+		server.handleListJobs(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("Expected 200, got %d: %s", w.Code, w.Body.String())
+		}
+
+		var resp struct {
+			Jobs []storage.ReviewJob `json:"jobs"`
+		}
+		testutil.DecodeJSON(t, w, &resp)
+
+		if len(resp.Jobs) != 1 {
+			t.Fatalf("Expected 1 non-fix job, got %d", len(resp.Jobs))
+		}
+		if resp.Jobs[0].JobType == storage.JobTypeFix {
+			t.Error("Expected non-fix job, got fix")
+		}
+	})
+}
+
+func TestHandleFixJobStaleValidation(t *testing.T) {
+	server, db, tmpDir := newTestServer(t)
+
+	repoDir := filepath.Join(tmpDir, "repo-fix-val")
+	testutil.InitTestGitRepo(t, repoDir)
+	repo, _ := db.GetOrCreateRepo(repoDir)
+	commit, _ := db.GetOrCreateCommit(
+		repo.ID, "fix-val-abc", "Author", "Subject", time.Now(),
+	)
+
+	// Create a review job and complete it with output
+	reviewJob, _ := db.EnqueueJob(storage.EnqueueOpts{
+		RepoID:   repo.ID,
+		CommitID: commit.ID,
+		GitRef:   "fix-val-abc",
+		Agent:    "test",
+	})
+	db.ClaimJob("w1")
+	db.CompleteJob(reviewJob.ID, "test", "prompt", "FAIL: issues found")
+
+	t.Run("fix job as parent is rejected", func(t *testing.T) {
+		// Create a fix job and try to use it as a parent
+		fixJob, _ := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID:      repo.ID,
+			CommitID:    commit.ID,
+			GitRef:      "fix-val-abc",
+			Agent:       "test",
+			JobType:     storage.JobTypeFix,
+			ParentJobID: reviewJob.ID,
+		})
+		db.ClaimJob("w-fix-parent")
+		db.CompleteJob(fixJob.ID, "test", "prompt", "done")
+
+		body := map[string]any{
+			"parent_job_id": fixJob.ID,
+		}
+		req := testutil.MakeJSONRequest(
+			t, http.MethodPost, "/api/job/fix", body,
+		)
+		w := httptest.NewRecorder()
+		server.handleFixJob(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf(
+				"Expected 400 for fix-job parent, got %d: %s",
+				w.Code, w.Body.String(),
+			)
+		}
+	})
+
+	t.Run("stale job that is not a fix job is rejected", func(t *testing.T) {
+		// reviewJob is a review, not a fix job
+		body := map[string]any{
+			"parent_job_id": reviewJob.ID,
+			"stale_job_id":  reviewJob.ID,
+		}
+		req := testutil.MakeJSONRequest(
+			t, http.MethodPost, "/api/job/fix", body,
+		)
+		w := httptest.NewRecorder()
+		server.handleFixJob(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected 400 for non-fix stale job, got %d: %s",
+				w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("stale job with wrong parent is rejected", func(t *testing.T) {
+		// Create a second review + fix in the SAME repo, linked to the other review
+		review2, _ := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID:   repo.ID,
+			CommitID: commit.ID,
+			GitRef:   "fix-val-def",
+			Agent:    "test",
+		})
+		db.ClaimJob("w3")
+		db.CompleteJob(review2.ID, "test", "prompt", "FAIL: other issues")
+
+		wrongParentFix, _ := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID:      repo.ID,
+			CommitID:    commit.ID,
+			GitRef:      "fix-val-def",
+			Agent:       "test",
+			JobType:     storage.JobTypeFix,
+			ParentJobID: review2.ID,
+		})
+		// Complete it so it has terminal status + patch
+		db.ClaimJob("w4")
+		db.CompleteJob(wrongParentFix.ID, "test", "prompt", "done")
+		db.SaveJobPatch(wrongParentFix.ID, "--- a/f\n+++ b/f\n")
+
+		body := map[string]any{
+			"parent_job_id": reviewJob.ID,
+			"stale_job_id":  wrongParentFix.ID,
+		}
+		req := testutil.MakeJSONRequest(
+			t, http.MethodPost, "/api/job/fix", body,
+		)
+		w := httptest.NewRecorder()
+		server.handleFixJob(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected 400 for wrong-parent stale job, got %d: %s",
+				w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("stale job without patch is rejected", func(t *testing.T) {
+		// Create a fix job linked to reviewJob but with no patch
+		noPatchFix, _ := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID:      repo.ID,
+			CommitID:    commit.ID,
+			GitRef:      "fix-val-abc",
+			Agent:       "test",
+			JobType:     storage.JobTypeFix,
+			ParentJobID: reviewJob.ID,
+		})
+		// Complete it (terminal status) but don't set a patch
+		db.ClaimJob("w5")
+		db.CompleteJob(noPatchFix.ID, "test", "prompt", "done but no diff")
+
+		body := map[string]any{
+			"parent_job_id": reviewJob.ID,
+			"stale_job_id":  noPatchFix.ID,
+		}
+		req := testutil.MakeJSONRequest(
+			t, http.MethodPost, "/api/job/fix", body,
+		)
+		w := httptest.NewRecorder()
+		server.handleFixJob(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected 400 for patchless stale job, got %d: %s",
+				w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("non-terminal stale job statuses are rejected", func(t *testing.T) {
+		for _, status := range []storage.JobStatus{
+			storage.JobStatusQueued,
+			storage.JobStatusRunning,
+			storage.JobStatusFailed,
+			storage.JobStatusCanceled,
+		} {
+			t.Run(string(status), func(t *testing.T) {
+				fixJob, _ := db.EnqueueJob(storage.EnqueueOpts{
+					RepoID:      repo.ID,
+					CommitID:    commit.ID,
+					GitRef:      "fix-val-abc",
+					Agent:       "test",
+					JobType:     storage.JobTypeFix,
+					ParentJobID: reviewJob.ID,
+				})
+				// Move to desired status
+				switch status {
+				case storage.JobStatusRunning:
+					db.ClaimJob("w-term")
+				case storage.JobStatusFailed:
+					db.ClaimJob("w-term")
+					db.FailJob(fixJob.ID, "w-term", "broke")
+				case storage.JobStatusCanceled:
+					db.CancelJob(fixJob.ID)
+				}
+				// queued needs no extra action
+
+				body := map[string]any{
+					"parent_job_id": reviewJob.ID,
+					"stale_job_id":  fixJob.ID,
+				}
+				req := testutil.MakeJSONRequest(
+					t, http.MethodPost, "/api/job/fix", body,
+				)
+				w := httptest.NewRecorder()
+				server.handleFixJob(w, req)
+
+				if w.Code != http.StatusBadRequest {
+					t.Errorf(
+						"Expected 400 for %s stale job, got %d: %s",
+						status, w.Code, w.Body.String(),
+					)
+				}
+			})
+		}
+	})
+
+	t.Run("stale job from different repo is rejected", func(t *testing.T) {
+		// Create a fix job in a different repo
+		repo2Dir := filepath.Join(tmpDir, "repo-fix-val-2")
+		testutil.InitTestGitRepo(t, repo2Dir)
+		repo2, _ := db.GetOrCreateRepo(repo2Dir)
+		commit2, _ := db.GetOrCreateCommit(
+			repo2.ID, "other-sha", "Author", "Subject", time.Now(),
+		)
+		otherReview, _ := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID:   repo2.ID,
+			CommitID: commit2.ID,
+			GitRef:   "other-sha",
+			Agent:    "test",
+		})
+		db.ClaimJob("w2")
+		db.CompleteJob(otherReview.ID, "test", "prompt", "FAIL")
+
+		otherFix, _ := db.EnqueueJob(storage.EnqueueOpts{
+			RepoID:      repo2.ID,
+			CommitID:    commit2.ID,
+			GitRef:      "other-sha",
+			Agent:       "test",
+			JobType:     storage.JobTypeFix,
+			ParentJobID: otherReview.ID,
+		})
+
+		body := map[string]any{
+			"parent_job_id": reviewJob.ID,
+			"stale_job_id":  otherFix.ID,
+		}
+		req := testutil.MakeJSONRequest(
+			t, http.MethodPost, "/api/job/fix", body,
+		)
+		w := httptest.NewRecorder()
+		server.handleFixJob(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("Expected 400 for cross-repo stale job, got %d: %s",
+				w.Code, w.Body.String())
+		}
+	})
 }

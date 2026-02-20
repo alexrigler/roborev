@@ -31,6 +31,8 @@ const (
 	JobStatusDone     JobStatus = "done"
 	JobStatusFailed   JobStatus = "failed"
 	JobStatusCanceled JobStatus = "canceled"
+	JobStatusApplied  JobStatus = "applied"
+	JobStatusRebased  JobStatus = "rebased"
 )
 
 // JobType classifies what kind of work a review job represents.
@@ -40,6 +42,7 @@ const (
 	JobTypeDirty   = "dirty"   // Uncommitted changes review
 	JobTypeTask    = "task"    // Run/analyze/design/custom prompt
 	JobTypeCompact = "compact" // Consolidated review verification
+	JobTypeFix     = "fix"     // Background fix using worktree
 )
 
 type ReviewJob struct {
@@ -65,6 +68,8 @@ type ReviewJob struct {
 	ReviewType   string     `json:"review_type,omitempty"`   // Review type (e.g., "security") - changes system prompt
 	PatchID      string     `json:"patch_id,omitempty"`      // Stable patch-id for rebase tracking
 	OutputPrefix string     `json:"output_prefix,omitempty"` // Prefix to prepend to review output
+	ParentJobID  *int64     `json:"parent_job_id,omitempty"` // Job being fixed (for fix jobs)
+	Patch        *string    `json:"patch,omitempty"`         // Generated diff patch (for completed fix jobs)
 	// Sync fields
 	UUID            string     `json:"uuid,omitempty"`              // Globally unique identifier for sync
 	SourceMachineID string     `json:"source_machine_id,omitempty"` // Machine that created this job
@@ -114,11 +119,22 @@ func (j ReviewJob) IsTaskJob() bool {
 	return true
 }
 
-// IsPromptJob returns true if this job type uses a pre-stored prompt
-// (task or compact). These job types have prompts built by the CLI at
-// enqueue time, not constructed by the worker from git data.
-func (j ReviewJob) IsPromptJob() bool {
-	return j.JobType == JobTypeTask || j.JobType == JobTypeCompact
+// UsesStoredPrompt returns true if this job type uses a pre-stored prompt
+// (task, compact, or fix). These job types have prompts built at enqueue
+// time, not constructed by the worker from git data.
+func (j ReviewJob) UsesStoredPrompt() bool {
+	return j.JobType == JobTypeTask || j.JobType == JobTypeCompact || j.JobType == JobTypeFix
+}
+
+// IsFixJob returns true if this is a background fix job.
+func (j ReviewJob) IsFixJob() bool {
+	return j.JobType == JobTypeFix
+}
+
+// HasViewableOutput returns true if this job has completed and its review/patch
+// can be viewed. This covers done, applied, and rebased terminal states.
+func (j ReviewJob) HasViewableOutput() bool {
+	return j.Status == JobStatusDone || j.Status == JobStatusApplied || j.Status == JobStatusRebased
 }
 
 // JobWithReview pairs a job with its review for batch operations
@@ -167,6 +183,8 @@ type DaemonStatus struct {
 	CompletedJobs       int    `json:"completed_jobs"`
 	FailedJobs          int    `json:"failed_jobs"`
 	CanceledJobs        int    `json:"canceled_jobs"`
+	AppliedJobs         int    `json:"applied_jobs"`
+	RebasedJobs         int    `json:"rebased_jobs"`
 	ActiveWorkers       int    `json:"active_workers"`
 	MaxWorkers          int    `json:"max_workers"`
 	MachineID           string `json:"machine_id,omitempty"`            // Local machine ID for remote job detection

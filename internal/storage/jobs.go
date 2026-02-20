@@ -726,7 +726,8 @@ type EnqueueOpts struct {
 	OutputPrefix string // Prefix to prepend to review output
 	Agentic      bool   // Allow file edits and command execution
 	Label        string // Display label in TUI for task jobs (default: "prompt")
-	JobType      string // Explicit job type (review/range/dirty/task/compact); inferred if empty
+	JobType      string // Explicit job type (review/range/dirty/task/compact/fix); inferred if empty
+	ParentJobID  int64  // Parent job being fixed (for fix jobs)
 }
 
 // EnqueueJob creates a new review job. The job type is inferred from opts.
@@ -779,16 +780,22 @@ func (db *DB) EnqueueJob(opts EnqueueOpts) (*ReviewJob, error) {
 		commitIDParam = opts.CommitID
 	}
 
+	// Use NULL for parent_job_id when not a fix job
+	var parentJobIDParam any
+	if opts.ParentJobID > 0 {
+		parentJobIDParam = opts.ParentJobID
+	}
+
 	result, err := db.Exec(`
 		INSERT INTO review_jobs (repo_id, commit_id, git_ref, branch, agent, model, reasoning,
 			status, job_type, review_type, patch_id, diff_content, prompt, agentic, output_prefix,
-			uuid, source_machine_id, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			parent_job_id, uuid, source_machine_id, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		opts.RepoID, commitIDParam, gitRef, nullString(opts.Branch),
 		opts.Agent, nullString(opts.Model), reasoning,
 		jobType, opts.ReviewType, nullString(opts.PatchID),
 		nullString(opts.DiffContent), nullString(opts.Prompt), agenticInt,
-		nullString(opts.OutputPrefix),
+		nullString(opts.OutputPrefix), parentJobIDParam,
 		uid, machineID, nowStr)
 	if err != nil {
 		return nil, err
@@ -814,6 +821,9 @@ func (db *DB) EnqueueJob(opts EnqueueOpts) (*ReviewJob, error) {
 		UUID:            uid,
 		SourceMachineID: machineID,
 		UpdatedAt:       &now,
+	}
+	if opts.ParentJobID > 0 {
+		job.ParentJobID = &opts.ParentJobID
 	}
 	if opts.CommitID > 0 {
 		job.CommitID = &opts.CommitID
@@ -867,10 +877,11 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 	var reviewType sql.NullString
 	var outputPrefix sql.NullString
 	var patchID sql.NullString
+	var parentJobID sql.NullInt64
 	err = db.QueryRow(`
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.agent, j.model, j.reasoning, j.status, j.enqueued_at,
 		       r.root_path, r.name, c.subject, j.diff_content, j.prompt, COALESCE(j.agentic, 0), j.job_type, j.review_type,
-		       j.output_prefix, j.patch_id
+		       j.output_prefix, j.patch_id, j.parent_job_id
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
@@ -879,7 +890,7 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 		LIMIT 1
 	`, workerID).Scan(&job.ID, &job.RepoID, &commitID, &job.GitRef, &branch, &job.Agent, &model, &job.Reasoning, &job.Status, &enqueuedAt,
 		&job.RepoPath, &job.RepoName, &commitSubject, &diffContent, &prompt, &agenticInt, &jobType, &reviewType,
-		&outputPrefix, &patchID)
+		&outputPrefix, &patchID, &parentJobID)
 	if err != nil {
 		return nil, err
 	}
@@ -915,6 +926,9 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 	if patchID.Valid {
 		job.PatchID = patchID.String
 	}
+	if parentJobID.Valid {
+		job.ParentJobID = &parentJobID.Int64
+	}
 	job.EnqueuedAt = parseSQLiteTime(enqueuedAt)
 	job.Status = JobStatusRunning
 	job.WorkerID = workerID
@@ -926,6 +940,82 @@ func (db *DB) ClaimJob(workerID string) (*ReviewJob, error) {
 func (db *DB) SaveJobPrompt(jobID int64, prompt string) error {
 	_, err := db.Exec(`UPDATE review_jobs SET prompt = ? WHERE id = ?`, prompt, jobID)
 	return err
+}
+
+// SaveJobPatch stores the generated patch for a completed fix job
+func (db *DB) SaveJobPatch(jobID int64, patch string) error {
+	_, err := db.Exec(`UPDATE review_jobs SET patch = ? WHERE id = ?`, patch, jobID)
+	return err
+}
+
+// CompleteFixJob atomically marks a fix job as done, stores the review,
+// and persists the patch in a single transaction. This prevents invalid
+// states where a patch is written but the job isn't done, or vice versa.
+func (db *DB) CompleteFixJob(jobID int64, agent, prompt, output, patch string) error {
+	now := time.Now().Format(time.RFC3339)
+	machineID, _ := db.GetMachineID()
+	reviewUUID := GenerateUUID()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+				log.Printf("jobs CompleteFixJob: rollback failed: %v", err)
+			}
+		}
+	}()
+
+	// Fetch output_prefix from job (if any)
+	var outputPrefix sql.NullString
+	err = conn.QueryRowContext(ctx, `SELECT output_prefix FROM review_jobs WHERE id = ?`, jobID).Scan(&outputPrefix)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
+
+	finalOutput := output
+	if outputPrefix.Valid && outputPrefix.String != "" {
+		finalOutput = outputPrefix.String + output
+	}
+
+	// Atomically set status=done AND patch in one UPDATE
+	result, err := conn.ExecContext(ctx,
+		`UPDATE review_jobs SET status = 'done', finished_at = ?, updated_at = ?, patch = ? WHERE id = ? AND status = 'running'`,
+		now, now, patch, jobID)
+	if err != nil {
+		return err
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return nil // Job was canceled
+	}
+
+	_, err = conn.ExecContext(ctx,
+		`INSERT INTO reviews (job_id, agent, prompt, output, uuid, updated_by_machine_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		jobID, agent, prompt, finalOutput, reviewUUID, machineID, now)
+	if err != nil {
+		return err
+	}
+
+	_, err = conn.ExecContext(ctx, "COMMIT")
+	if err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }
 
 // CompleteJob marks a job as done and stores the review.
@@ -1051,6 +1141,49 @@ func (db *DB) CancelJob(jobID int64) error {
 	return nil
 }
 
+// MarkJobApplied transitions a fix job from done to applied.
+func (db *DB) MarkJobApplied(jobID int64) error {
+	now := time.Now().Format(time.RFC3339)
+	result, err := db.Exec(`
+		UPDATE review_jobs
+		SET status = 'applied', updated_at = ?
+		WHERE id = ? AND status = 'done' AND job_type = 'fix'
+	`, now, jobID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// MarkJobRebased transitions a done fix job to the "rebased" terminal state.
+// This indicates the patch was stale and a new rebase job was triggered.
+func (db *DB) MarkJobRebased(jobID int64) error {
+	now := time.Now().Format(time.RFC3339)
+	result, err := db.Exec(`
+		UPDATE review_jobs
+		SET status = 'rebased', updated_at = ?
+		WHERE id = ? AND status = 'done' AND job_type = 'fix'
+	`, now, jobID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // ReenqueueJob resets a completed, failed, or canceled job back to queued status.
 // This allows manual re-running of jobs to get a fresh review.
 // For done jobs, the existing review is deleted to avoid unique constraint violations.
@@ -1083,7 +1216,7 @@ func (db *DB) ReenqueueJob(jobID int64) error {
 	// Reset job status
 	result, err := conn.ExecContext(ctx, `
 		UPDATE review_jobs
-		SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = 0
+		SET status = 'queued', worker_id = NULL, started_at = NULL, finished_at = NULL, error = NULL, retry_count = 0, patch = NULL
 		WHERE id = ? AND status IN ('done', 'failed', 'canceled')
 	`, jobID)
 	if err != nil {
@@ -1182,6 +1315,8 @@ type listJobsOptions struct {
 	branch             string
 	branchIncludeEmpty bool
 	addressed          *bool
+	jobType            string
+	excludeJobType     string
 }
 
 // WithGitRef filters jobs by git ref.
@@ -1208,6 +1343,16 @@ func WithAddressed(addressed bool) ListJobsOption {
 	return func(o *listJobsOptions) { o.addressed = &addressed }
 }
 
+// WithJobType filters jobs by job_type (e.g. "fix", "review").
+func WithJobType(jobType string) ListJobsOption {
+	return func(o *listJobsOptions) { o.jobType = jobType }
+}
+
+// WithExcludeJobType excludes jobs of the given type.
+func WithExcludeJobType(jobType string) ListJobsOption {
+	return func(o *listJobsOptions) { o.excludeJobType = jobType }
+}
+
 // ListJobs returns jobs with optional status, repo, branch, and addressed filters.
 // addressedFilter: nil = no filter, non-nil bool = filter by addressed state.
 func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int, opts ...ListJobsOption) ([]ReviewJob, error) {
@@ -1215,7 +1360,8 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.agent, j.reasoning, j.status, j.enqueued_at,
 		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, j.retry_count,
 		       COALESCE(j.agentic, 0), r.root_path, r.name, c.subject, rv.addressed, rv.output,
-		       j.source_machine_id, j.uuid, j.model, j.job_type, j.review_type, j.patch_id
+		       j.source_machine_id, j.uuid, j.model, j.job_type, j.review_type, j.patch_id,
+		       j.parent_job_id
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
@@ -1255,6 +1401,14 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 			conditions = append(conditions, "(rv.addressed IS NULL OR rv.addressed = 0)")
 		}
 	}
+	if o.jobType != "" {
+		conditions = append(conditions, "j.job_type = ?")
+		args = append(args, o.jobType)
+	}
+	if o.excludeJobType != "" {
+		conditions = append(conditions, "j.job_type != ?")
+		args = append(args, o.excludeJobType)
+	}
 
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
@@ -1287,11 +1441,13 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 		var commitSubject sql.NullString
 		var addressed sql.NullInt64
 		var agentic int
+		var parentJobID sql.NullInt64
 
 		err := rows.Scan(&j.ID, &j.RepoID, &commitID, &j.GitRef, &branch, &j.Agent, &j.Reasoning, &j.Status, &enqueuedAt,
 			&startedAt, &finishedAt, &workerID, &errMsg, &prompt, &j.RetryCount,
 			&agentic, &j.RepoPath, &j.RepoName, &commitSubject, &addressed, &output,
-			&sourceMachineID, &jobUUID, &model, &jobTypeStr, &reviewTypeStr, &patchIDStr)
+			&sourceMachineID, &jobUUID, &model, &jobTypeStr, &reviewTypeStr, &patchIDStr,
+			&parentJobID)
 		if err != nil {
 			return nil, err
 		}
@@ -1345,6 +1501,9 @@ func (db *DB) ListJobs(statusFilter string, repoFilter string, limit, offset int
 		if addressed.Valid {
 			val := addressed.Int64 != 0
 			j.Addressed = &val
+		}
+		if parentJobID.Valid {
+			j.ParentJobID = &parentJobID.Int64
 		}
 		// Compute verdict only for non-task jobs (task jobs don't have PASS/FAIL verdicts)
 		// Task jobs (run, analyze, custom) are identified by having no commit_id and not being dirty
@@ -1415,19 +1574,23 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	var commitID sql.NullInt64
 	var commitSubject sql.NullString
 	var agentic int
+	var parentJobID sql.NullInt64
+	var patch sql.NullString
 
 	var model, branch, jobTypeStr, reviewTypeStr, patchIDStr sql.NullString
 	err := db.QueryRow(`
 		SELECT j.id, j.repo_id, j.commit_id, j.git_ref, j.branch, j.agent, j.reasoning, j.status, j.enqueued_at,
 		       j.started_at, j.finished_at, j.worker_id, j.error, j.prompt, COALESCE(j.agentic, 0),
-		       r.root_path, r.name, c.subject, j.model, j.job_type, j.review_type, j.patch_id
+		       r.root_path, r.name, c.subject, j.model, j.job_type, j.review_type, j.patch_id,
+		       j.parent_job_id, j.patch
 		FROM review_jobs j
 		JOIN repos r ON r.id = j.repo_id
 		LEFT JOIN commits c ON c.id = j.commit_id
 		WHERE j.id = ?
 	`, id).Scan(&j.ID, &j.RepoID, &commitID, &j.GitRef, &branch, &j.Agent, &j.Reasoning, &j.Status, &enqueuedAt,
 		&startedAt, &finishedAt, &workerID, &errMsg, &prompt, &agentic,
-		&j.RepoPath, &j.RepoName, &commitSubject, &model, &jobTypeStr, &reviewTypeStr, &patchIDStr)
+		&j.RepoPath, &j.RepoName, &commitSubject, &model, &jobTypeStr, &reviewTypeStr, &patchIDStr,
+		&parentJobID, &patch)
 	if err != nil {
 		return nil, err
 	}
@@ -1472,12 +1635,18 @@ func (db *DB) GetJobByID(id int64) (*ReviewJob, error) {
 	if branch.Valid {
 		j.Branch = branch.String
 	}
+	if parentJobID.Valid {
+		j.ParentJobID = &parentJobID.Int64
+	}
+	if patch.Valid {
+		j.Patch = &patch.String
+	}
 
 	return &j, nil
 }
 
 // GetJobCounts returns counts of jobs by status
-func (db *DB) GetJobCounts() (queued, running, done, failed, canceled int, err error) {
+func (db *DB) GetJobCounts() (queued, running, done, failed, canceled, applied, rebased int, err error) {
 	rows, err := db.Query(`SELECT status, COUNT(*) FROM review_jobs GROUP BY status`)
 	if err != nil {
 		return
@@ -1501,6 +1670,10 @@ func (db *DB) GetJobCounts() (queued, running, done, failed, canceled int, err e
 			failed = count
 		case JobStatusCanceled:
 			canceled = count
+		case JobStatusApplied:
+			applied = count
+		case JobStatusRebased:
+			rebased = count
 		}
 	}
 	err = rows.Err()

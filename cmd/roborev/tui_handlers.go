@@ -21,6 +21,12 @@ func (m tuiModel) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleFilterKey(msg)
 	case tuiViewTail:
 		return m.handleTailKey(msg)
+	case tuiViewFixPrompt:
+		return m.handleFixPromptKey(msg)
+	case tuiViewTasks:
+		return m.handleTasksKey(msg)
+	case tuiViewPatch:
+		return m.handlePatchKey(msg)
 	}
 
 	// Global keys shared across queue/review/prompt/commitMsg/help views
@@ -375,17 +381,27 @@ func (m tuiModel) handleGlobalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleHelpKey()
 	case "esc":
 		return m.handleEscKey()
+	case "F":
+		return m.handleFixKey()
+	case "T":
+		return m.handleToggleTasksKey()
 	}
 	return m, nil
 }
 
 func (m tuiModel) handleQuitKey() (tea.Model, tea.Cmd) {
 	if m.currentView == tuiViewReview {
-		m.currentView = tuiViewQueue
+		returnTo := m.reviewFromView
+		if returnTo == 0 {
+			returnTo = tuiViewQueue
+		}
+		m.currentView = returnTo
 		m.currentReview = nil
 		m.reviewScroll = 0
 		m.paginateNav = 0
-		m.normalizeSelectionIfHidden()
+		if returnTo == tuiViewQueue {
+			m.normalizeSelectionIfHidden()
+		}
 		return m, nil
 	}
 	if m.currentView == tuiViewPrompt {
@@ -694,6 +710,7 @@ func (m tuiModel) handleEnterKey() (tea.Model, tea.Cmd) {
 	job := m.jobs[m.selectedIdx]
 	switch job.Status {
 	case storage.JobStatusDone:
+		m.reviewFromView = tuiViewQueue
 		return m, m.fetchReview(job.ID)
 	case storage.JobStatusFailed:
 		m.currentBranch = ""
@@ -702,6 +719,7 @@ func (m tuiModel) handleEnterKey() (tea.Model, tea.Cmd) {
 			Output: "Job failed:\n\n" + job.Error,
 			Job:    &job,
 		}
+		m.reviewFromView = tuiViewQueue
 		m.currentView = tuiViewReview
 		m.reviewScroll = 0
 		return m, nil
@@ -853,6 +871,21 @@ func (m tuiModel) handleRerunKey() (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) handleTailKey2() (tea.Model, tea.Cmd) {
+	// From prompt view: allow tailing the running job being viewed
+	if m.currentView == tuiViewPrompt && m.currentReview != nil && m.currentReview.Job != nil {
+		job := m.currentReview.Job
+		if job.Status == storage.JobStatusRunning {
+			m.tailJobID = job.ID
+			m.tailLines = nil
+			m.tailScroll = 0
+			m.tailStreaming = true
+			m.tailFollow = true
+			m.tailFromView = m.reviewFromView
+			m.currentView = tuiViewTail
+			return m, tea.Batch(tea.ClearScreen, m.fetchTailOutput(job.ID))
+		}
+	}
+
 	if m.currentView != tuiViewQueue || len(m.jobs) == 0 || m.selectedIdx < 0 || m.selectedIdx >= len(m.jobs) {
 		return m, nil
 	}
@@ -1034,14 +1067,20 @@ func (m tuiModel) handleEscKey() (tea.Model, tea.Cmd) {
 		m.loadingJobs = true
 		return m, m.fetchJobs()
 	} else if m.currentView == tuiViewReview {
-		m.currentView = tuiViewQueue
+		returnTo := m.reviewFromView
+		if returnTo == 0 {
+			returnTo = tuiViewQueue
+		}
+		m.currentView = returnTo
 		m.currentReview = nil
 		m.reviewScroll = 0
 		m.paginateNav = 0
-		m.normalizeSelectionIfHidden()
-		if m.hideAddressed && !m.loadingJobs {
-			m.loadingJobs = true
-			return m, m.fetchJobs()
+		if returnTo == tuiViewQueue {
+			m.normalizeSelectionIfHidden()
+			if m.hideAddressed && !m.loadingJobs {
+				m.loadingJobs = true
+				return m, m.fetchJobs()
+			}
 		}
 	} else if m.currentView == tuiViewPrompt {
 		m.paginateNav = 0
@@ -1328,6 +1367,279 @@ func (m tuiModel) handleReconnectMsg(msg tuiReconnectMsg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 		return m, tea.Batch(cmds...)
+	}
+	return m, nil
+}
+
+// handleFixKey opens the fix prompt modal for the currently selected job.
+func (m tuiModel) handleFixKey() (tea.Model, tea.Cmd) {
+	if m.currentView != tuiViewQueue && m.currentView != tuiViewReview {
+		return m, nil
+	}
+
+	// Get the selected job
+	var job storage.ReviewJob
+	if m.currentView == tuiViewReview {
+		if m.currentReview == nil || m.currentReview.Job == nil {
+			return m, nil
+		}
+		job = *m.currentReview.Job
+	} else {
+		if len(m.jobs) == 0 || m.selectedIdx < 0 || m.selectedIdx >= len(m.jobs) {
+			return m, nil
+		}
+		job = m.jobs[m.selectedIdx]
+	}
+
+	// Only allow fix on completed review jobs (not fix jobs —
+	// fix-of-fix chains are not supported).
+	if job.IsFixJob() {
+		m.flashMessage = "Cannot fix a fix job"
+		m.flashExpiresAt = time.Now().Add(2 * time.Second)
+		m.flashView = m.currentView
+		return m, nil
+	}
+	if job.Status != storage.JobStatusDone {
+		m.flashMessage = "Can only fix completed reviews"
+		m.flashExpiresAt = time.Now().Add(2 * time.Second)
+		m.flashView = m.currentView
+		return m, nil
+	}
+
+	// Open fix prompt modal
+	m.fixPromptJobID = job.ID
+	m.fixPromptText = "" // Empty means use default prompt from server
+	m.fixPromptFromView = m.currentView
+	m.currentView = tuiViewFixPrompt
+	return m, nil
+}
+
+// handleToggleTasksKey switches between queue and tasks view.
+func (m tuiModel) handleToggleTasksKey() (tea.Model, tea.Cmd) {
+	if m.currentView == tuiViewTasks {
+		m.currentView = tuiViewQueue
+		return m, nil
+	}
+	if m.currentView == tuiViewQueue {
+		m.currentView = tuiViewTasks
+		return m, m.fetchFixJobs()
+	}
+	return m, nil
+}
+
+// handleFixPromptKey handles key input in the fix prompt confirmation modal.
+func (m tuiModel) handleFixPromptKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.currentView = m.fixPromptFromView
+		m.fixPromptText = ""
+		m.fixPromptJobID = 0
+		return m, nil
+	case "enter":
+		jobID := m.fixPromptJobID
+		prompt := m.fixPromptText
+		m.currentView = tuiViewTasks
+		m.fixPromptText = ""
+		m.fixPromptJobID = 0
+		return m, m.triggerFix(jobID, prompt)
+	case "backspace":
+		if len(m.fixPromptText) > 0 {
+			runes := []rune(m.fixPromptText)
+			m.fixPromptText = string(runes[:len(runes)-1])
+		}
+		return m, nil
+	default:
+		if len(msg.Runes) > 0 {
+			for _, r := range msg.Runes {
+				if unicode.IsPrint(r) || r == '\n' || r == '\t' {
+					m.fixPromptText += string(r)
+				}
+			}
+		}
+		return m, nil
+	}
+}
+
+// handleTasksKey handles key input in the tasks view.
+func (m tuiModel) handleTasksKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "esc", "T":
+		m.currentView = tuiViewQueue
+		return m, nil
+	case "up", "k":
+		if m.fixSelectedIdx > 0 {
+			m.fixSelectedIdx--
+		}
+		return m, nil
+	case "down", "j":
+		if m.fixSelectedIdx < len(m.fixJobs)-1 {
+			m.fixSelectedIdx++
+		}
+		return m, nil
+	case "enter":
+		// View task: prompt for running, review for done/applied, error for failed
+		if len(m.fixJobs) > 0 && m.fixSelectedIdx < len(m.fixJobs) {
+			job := m.fixJobs[m.fixSelectedIdx]
+			switch {
+			case job.Status == storage.JobStatusRunning:
+				if job.Prompt != "" {
+					m.currentReview = &storage.Review{
+						Agent:  job.Agent,
+						Prompt: job.Prompt,
+						Job:    &job,
+					}
+					m.reviewFromView = tuiViewTasks
+					m.currentView = tuiViewPrompt
+					m.promptScroll = 0
+					m.promptFromQueue = false
+					return m, nil
+				}
+				// No prompt yet, go straight to tail
+				m.tailJobID = job.ID
+				m.tailLines = nil
+				m.tailScroll = 0
+				m.tailStreaming = true
+				m.tailFollow = true
+				m.tailFromView = tuiViewTasks
+				m.currentView = tuiViewTail
+				return m, tea.Batch(tea.ClearScreen, m.fetchTailOutput(job.ID))
+			case job.HasViewableOutput():
+				m.selectedJobID = job.ID
+				m.reviewFromView = tuiViewTasks
+				return m, m.fetchReview(job.ID)
+			case job.Status == storage.JobStatusFailed:
+				errMsg := job.Error
+				if errMsg == "" {
+					errMsg = "unknown error"
+				}
+				m.flashMessage = fmt.Sprintf("Job #%d failed: %s", job.ID, errMsg)
+				m.flashExpiresAt = time.Now().Add(5 * time.Second)
+				m.flashView = tuiViewTasks
+			}
+		}
+		return m, nil
+	case "t":
+		// Tail output: live for running jobs, review for done, error for failed
+		if len(m.fixJobs) > 0 && m.fixSelectedIdx < len(m.fixJobs) {
+			job := m.fixJobs[m.fixSelectedIdx]
+			switch {
+			case job.Status == storage.JobStatusRunning:
+				m.tailJobID = job.ID
+				m.tailLines = nil
+				m.tailScroll = 0
+				m.tailStreaming = true
+				m.tailFollow = true
+				m.tailFromView = tuiViewTasks
+				m.currentView = tuiViewTail
+				return m, tea.Batch(tea.ClearScreen, m.fetchTailOutput(job.ID))
+			case job.HasViewableOutput():
+				m.selectedJobID = job.ID
+				m.reviewFromView = tuiViewTasks
+				return m, m.fetchReview(job.ID)
+			case job.Status == storage.JobStatusFailed:
+				errMsg := job.Error
+				if errMsg == "" {
+					errMsg = "unknown error"
+				}
+				m.flashMessage = fmt.Sprintf("Job #%d failed: %s", job.ID, errMsg)
+				m.flashExpiresAt = time.Now().Add(5 * time.Second)
+				m.flashView = tuiViewTasks
+			}
+		}
+		return m, nil
+	case "A":
+		// Apply patch (handled in Phase 5)
+		if len(m.fixJobs) > 0 && m.fixSelectedIdx < len(m.fixJobs) {
+			job := m.fixJobs[m.fixSelectedIdx]
+			if job.Status == storage.JobStatusDone {
+				return m, m.applyFixPatch(job.ID)
+			}
+		}
+		return m, nil
+	case "R":
+		// Manually trigger rebase for a completed or rebased fix job
+		if len(m.fixJobs) > 0 && m.fixSelectedIdx < len(m.fixJobs) {
+			job := m.fixJobs[m.fixSelectedIdx]
+			if job.Status == storage.JobStatusDone || job.Status == storage.JobStatusRebased {
+				return m, m.triggerRebase(job.ID)
+			}
+		}
+		return m, nil
+	case "x":
+		// Cancel fix job
+		if len(m.fixJobs) > 0 && m.fixSelectedIdx < len(m.fixJobs) {
+			job := &m.fixJobs[m.fixSelectedIdx]
+			if job.Status == storage.JobStatusRunning || job.Status == storage.JobStatusQueued {
+				oldStatus := job.Status
+				oldFinishedAt := job.FinishedAt
+				job.Status = storage.JobStatusCanceled
+				now := time.Now()
+				job.FinishedAt = &now
+				return m, m.cancelJob(job.ID, oldStatus, oldFinishedAt)
+			}
+		}
+		return m, nil
+	case "p":
+		// View patch for completed fix jobs
+		if len(m.fixJobs) > 0 && m.fixSelectedIdx < len(m.fixJobs) {
+			job := m.fixJobs[m.fixSelectedIdx]
+			if job.HasViewableOutput() {
+				return m, m.fetchPatch(job.ID)
+			}
+			m.flashMessage = "Patch not yet available"
+			m.flashExpiresAt = time.Now().Add(2 * time.Second)
+			m.flashView = m.currentView
+		}
+		return m, nil
+	case "r":
+		// Refresh
+		return m, m.fetchFixJobs()
+	case "?":
+		m.fixShowHelp = !m.fixShowHelp
+		return m, nil
+	}
+	return m, nil
+}
+
+// handlePatchKey handles key input in the patch viewer.
+func (m tuiModel) handlePatchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "esc", "q":
+		m.currentView = tuiViewTasks
+		m.patchText = ""
+		m.patchScroll = 0
+		m.patchJobID = 0
+		return m, nil
+	case "up", "k":
+		if m.patchScroll > 0 {
+			m.patchScroll--
+		}
+		return m, nil
+	case "down", "j":
+		m.patchScroll++
+		return m, nil
+	case "pgup":
+		visibleLines := max(m.height-4, 1)
+		m.patchScroll = max(0, m.patchScroll-visibleLines)
+		return m, tea.ClearScreen
+	case "pgdown":
+		visibleLines := max(m.height-4, 1)
+		m.patchScroll += visibleLines
+		return m, tea.ClearScreen
+	case "home", "g":
+		m.patchScroll = 0
+		return m, nil
+	case "end", "G":
+		lines := strings.Split(m.patchText, "\n")
+		visibleRows := max(m.height-4, 1)
+		m.patchScroll = max(len(lines)-visibleRows, 0)
+		return m, nil
 	}
 	return m, nil
 }

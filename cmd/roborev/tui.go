@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -29,6 +31,8 @@ import (
 	"github.com/roborev-dev/roborev/internal/storage"
 	"github.com/roborev-dev/roborev/internal/update"
 	"github.com/roborev-dev/roborev/internal/version"
+	"github.com/roborev-dev/roborev/internal/worktree"
+	godiff "github.com/sourcegraph/go-diff/diff"
 	"github.com/spf13/cobra"
 )
 
@@ -104,6 +108,9 @@ const (
 	tuiViewCommitMsg
 	tuiViewHelp
 	tuiViewTail
+	tuiViewTasks     // Background fix tasks view
+	tuiViewFixPrompt // Fix prompt confirmation modal
+	tuiViewPatch     // Patch viewer for fix jobs
 )
 
 // queuePrefetchBuffer is the number of extra rows to fetch beyond what's visible,
@@ -247,6 +254,20 @@ type tuiModel struct {
 	mdCache *markdownCache
 
 	clipboard ClipboardWriter
+
+	// Review view navigation
+	reviewFromView tuiView // View to return to when exiting review (queue or tasks)
+
+	// Fix task state
+	fixJobs           []storage.ReviewJob // Fix jobs for tasks view
+	fixSelectedIdx    int                 // Selected index in tasks view
+	fixPromptText     string              // Editable fix prompt text
+	fixPromptJobID    int64               // Parent job ID for fix prompt modal
+	fixPromptFromView tuiView             // View to return to after fix prompt closes
+	fixShowHelp       bool                // Show help overlay in tasks view
+	patchText         string              // Current patch text for patch viewer
+	patchScroll       int                 // Scroll offset in patch viewer
+	patchJobID        int64               // Job ID of the patch being viewed
 }
 
 // pendingState tracks a pending addressed toggle with sequence number
@@ -359,6 +380,31 @@ type tuiReconnectMsg struct {
 	newAddr string // New daemon address if found, empty if not found
 	version string // Daemon version (to avoid sync call in Update)
 	err     error
+}
+
+type tuiFixJobsMsg struct {
+	jobs []storage.ReviewJob
+	err  error
+}
+
+type tuiFixTriggerResultMsg struct {
+	job     *storage.ReviewJob
+	err     error
+	warning string // non-fatal issue (e.g. failed to mark stale job)
+}
+
+type tuiApplyPatchResultMsg struct {
+	jobID       int64
+	parentJobID int64 // Parent review job (to mark addressed on success)
+	success     bool
+	err         error
+	rebase      bool // True if patch didn't apply and needs rebase
+}
+
+type tuiPatchMsg struct {
+	jobID int64
+	patch string
+	err   error
 }
 
 // ClipboardWriter is an interface for clipboard operations (allows mocking in tests)
@@ -602,6 +648,9 @@ func (m tuiModel) fetchJobs() tea.Cmd {
 			params.Set("addressed", "false")
 		}
 
+		// Exclude fix jobs — they belong in the Tasks view, not the queue
+		params.Set("exclude_job_type", "fix")
+
 		// Set limit: use pagination unless we need client-side filtering (multi-repo)
 		if needsAllJobs {
 			params.Set("limit", "0")
@@ -655,6 +704,7 @@ func (m tuiModel) fetchMoreJobs() tea.Cmd {
 		if m.hideAddressed {
 			params.Set("addressed", "false")
 		}
+		params.Set("exclude_job_type", "fix")
 		url := fmt.Sprintf("%s/api/jobs?%s", m.serverAddr, params.Encode())
 		resp, err := m.client.Get(url)
 		if err != nil {
@@ -1283,6 +1333,17 @@ func (m tuiModel) toggleAddressedForJob(jobID int64, currentState *bool) tea.Cmd
 	}
 }
 
+// markParentAddressed marks the parent review job as addressed after a fix is applied.
+func (m tuiModel) markParentAddressed(parentJobID int64) tea.Cmd {
+	return func() tea.Msg {
+		err := m.postAddressed(parentJobID, true, "parent review not found")
+		if err != nil {
+			return tuiErrMsg(err)
+		}
+		return nil
+	}
+}
+
 // updateSelectedJobID updates the tracked job ID after navigation
 func (m *tuiModel) updateSelectedJobID() {
 	if m.selectedIdx >= 0 && m.selectedIdx < len(m.jobs) {
@@ -1619,8 +1680,8 @@ func (m tuiModel) getVisibleJobs() []storage.ReviewJob {
 }
 
 // Queue help line constants (used by both queueVisibleRows and renderQueueView).
-const queueHelpLine1 = "x: cancel | r: rerun | t: tail | p: prompt | c: comment | y: copy | m: commit msg"
-const queueHelpLine2 = "↑/↓: navigate | enter: review | a: addressed | f: filter | h: hide | ?: commands | q: quit"
+const queueHelpLine1 = "x: cancel | r: rerun | t: tail | p: prompt | c: comment | y: copy | m: commit msg | F: fix"
+const queueHelpLine2 = "↑/↓: navigate | enter: review | a: addressed | f: filter | h: hide | T: tasks | ?: help | q: quit"
 
 // queueHelpLines computes how many terminal lines the queue help
 // footer occupies, accounting for wrapping at narrow widths.
@@ -1727,7 +1788,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.loadingMore || m.loadingJobs {
 			return m, tea.Batch(m.tick(), m.fetchStatus())
 		}
-		return m, tea.Batch(m.tick(), m.fetchJobs(), m.fetchStatus())
+		cmds := []tea.Cmd{m.tick(), m.fetchJobs(), m.fetchStatus()}
+		// Refresh fix jobs when viewing tasks or when fix jobs are in progress
+		if m.currentView == tuiViewTasks || m.hasActiveFixJobs() {
+			cmds = append(cmds, m.fetchFixJobs())
+		}
+		return m, tea.Batch(cmds...)
 
 	case tuiTailTickMsg:
 		if m.currentView == tuiViewTail && m.tailStreaming && m.tailJobID > 0 {
@@ -2016,6 +2082,74 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tuiReconnectMsg:
 		return m.handleReconnectMsg(msg)
+
+	case tuiFixJobsMsg:
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.fixJobs = msg.jobs
+			if m.fixSelectedIdx >= len(m.fixJobs) && len(m.fixJobs) > 0 {
+				m.fixSelectedIdx = len(m.fixJobs) - 1
+			}
+		}
+
+	case tuiFixTriggerResultMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			m.flashMessage = fmt.Sprintf("Fix failed: %v", msg.err)
+			m.flashExpiresAt = time.Now().Add(3 * time.Second)
+			m.flashView = tuiViewTasks
+		} else if msg.warning != "" {
+			m.flashMessage = msg.warning
+			m.flashExpiresAt = time.Now().Add(5 * time.Second)
+			m.flashView = tuiViewTasks
+			return m, m.fetchFixJobs()
+		} else {
+			m.flashMessage = fmt.Sprintf("Fix job #%d enqueued", msg.job.ID)
+			m.flashExpiresAt = time.Now().Add(3 * time.Second)
+			m.flashView = tuiViewTasks
+			// Refresh tasks list
+			return m, m.fetchFixJobs()
+		}
+
+	case tuiPatchMsg:
+		if msg.err != nil {
+			m.flashMessage = fmt.Sprintf("Patch fetch failed: %v", msg.err)
+			m.flashExpiresAt = time.Now().Add(3 * time.Second)
+			m.flashView = tuiViewTasks
+		} else {
+			m.patchText = msg.patch
+			m.patchJobID = msg.jobID
+			m.patchScroll = 0
+			m.currentView = tuiViewPatch
+		}
+
+	case tuiApplyPatchResultMsg:
+		if msg.rebase {
+			m.flashMessage = fmt.Sprintf("Patch for job #%d doesn't apply cleanly - triggering rebase", msg.jobID)
+			m.flashExpiresAt = time.Now().Add(5 * time.Second)
+			m.flashView = tuiViewTasks
+			return m, tea.Batch(m.triggerRebase(msg.jobID), m.fetchFixJobs())
+		} else if msg.success && msg.err != nil {
+			// Patch applied but commit failed
+			m.flashMessage = fmt.Sprintf("Job #%d: %v", msg.jobID, msg.err)
+			m.flashExpiresAt = time.Now().Add(5 * time.Second)
+			m.flashView = tuiViewTasks
+		} else if msg.err != nil {
+			m.flashMessage = fmt.Sprintf("Apply failed: %v", msg.err)
+			m.flashExpiresAt = time.Now().Add(3 * time.Second)
+			m.flashView = tuiViewTasks
+		} else {
+			m.flashMessage = fmt.Sprintf("Patch from job #%d applied and committed", msg.jobID)
+			m.flashExpiresAt = time.Now().Add(3 * time.Second)
+			m.flashView = tuiViewTasks
+			// Refresh tasks list to show updated status, and mark parent addressed
+			cmds := []tea.Cmd{m.fetchFixJobs()}
+			if msg.parentJobID > 0 {
+				cmds = append(cmds, m.markParentAddressed(msg.parentJobID))
+			}
+			return m, tea.Batch(cmds...)
+		}
 	}
 
 	return m, nil
@@ -2036,6 +2170,15 @@ func (m tuiModel) View() string {
 	}
 	if m.currentView == tuiViewTail {
 		return m.renderTailView()
+	}
+	if m.currentView == tuiViewTasks {
+		return m.renderTasksView()
+	}
+	if m.currentView == tuiViewFixPrompt {
+		return m.renderFixPromptView()
+	}
+	if m.currentView == tuiViewPatch {
+		return m.renderPatchView()
 	}
 	if m.currentView == tuiViewPrompt && m.currentReview != nil {
 		return m.renderPromptView()
@@ -2516,8 +2659,8 @@ func (m tuiModel) renderReviewView() string {
 		b.WriteString(tuiStatusStyle.Render(locationLine))
 		b.WriteString("\x1b[K") // Clear to end of line
 
-		// Show verdict and addressed status on next line
-		hasVerdict := review.Job.Verdict != nil && *review.Job.Verdict != ""
+		// Show verdict and addressed status on next line (skip verdict for fix jobs)
+		hasVerdict := review.Job.Verdict != nil && *review.Job.Verdict != "" && !review.Job.IsFixJob()
 		if hasVerdict || review.Addressed {
 			b.WriteString("\n")
 			if hasVerdict {
@@ -2599,7 +2742,7 @@ func (m tuiModel) renderReviewView() string {
 
 	// headerHeight = title + location line + status line (1) + help + verdict/addressed (0|1)
 	headerHeight := titleLines + locationLines + 1 + helpLines
-	hasVerdict := review.Job != nil && review.Job.Verdict != nil && *review.Job.Verdict != ""
+	hasVerdict := review.Job != nil && review.Job.Verdict != nil && *review.Job.Verdict != "" && !review.Job.IsFixJob()
 	if hasVerdict || review.Addressed {
 		headerHeight++ // Add 1 for verdict/addressed line
 	}
@@ -3135,6 +3278,8 @@ func helpLines() []string {
 				{"y", "Copy review to clipboard"},
 				{"x", "Cancel running/queued job"},
 				{"r", "Re-run completed/failed job"},
+				{"F", "Trigger fix for selected review"},
+				{"T", "Open Tasks view"},
 			},
 		},
 		{
@@ -3177,6 +3322,17 @@ func helpLines() []string {
 				{"g", "Toggle follow mode / jump to top"},
 				{"x", "Cancel job"},
 				{"esc/q", "Back to queue"},
+			},
+		},
+		{
+			group: "Tasks View",
+			keys: []struct{ key, desc string }{
+				{"↑/↓", "Navigate fix jobs"},
+				{"A", "Apply patch from completed fix"},
+				{"R", "Re-trigger fix (rebase)"},
+				{"t", "Tail running fix job output"},
+				{"x", "Cancel running/queued fix job"},
+				{"esc/T", "Back to queue"},
 			},
 		},
 		{
@@ -3284,3 +3440,516 @@ func tuiCmd() *cobra.Command {
 
 	return cmd
 }
+
+// renderTasksView renders the background fix tasks list.
+func (m tuiModel) renderTasksView() string {
+	var b strings.Builder
+
+	b.WriteString(tuiTitleStyle.Render("roborev tasks (background fixes)"))
+	b.WriteString("\x1b[K\n")
+
+	// Help overlay
+	if m.fixShowHelp {
+		return m.renderTasksHelpOverlay(&b)
+	}
+
+	if len(m.fixJobs) == 0 {
+		b.WriteString("\n  No fix tasks. Press F on a review to trigger a background fix.\n")
+		b.WriteString("\n")
+		b.WriteString(tuiHelpStyle.Render("T: back to queue | F: fix review | q: quit"))
+		b.WriteString("\x1b[K\x1b[J")
+		return b.String()
+	}
+
+	// Column layout: status, job, parent are fixed; ref and subject split remaining space.
+	const statusW = 8                                     // "canceled" is the longest
+	const idW = 5                                         // "#" + 4-digit number
+	const parentW = 11                                    // "fixes #NNNN"
+	fixedW := 2 + statusW + 1 + idW + 1 + parentW + 1 + 1 // prefix + inter-column spaces
+	flexW := max(m.width-fixedW, 15)
+	// Ref gets 25% of flexible space, subject gets 75%
+	refW := max(7, flexW*25/100)
+	subjectW := max(5, flexW-refW-1)
+
+	// Header
+	header := fmt.Sprintf("  %-*s %-*s %-*s %-*s %s",
+		statusW, "Status", idW, "Job", parentW, "Parent", refW, "Ref", "Subject")
+	b.WriteString(tuiStatusStyle.Render(header))
+	b.WriteString("\x1b[K\n")
+	b.WriteString("  " + strings.Repeat("-", min(m.width-4, 200)))
+	b.WriteString("\x1b[K\n")
+
+	// Render each fix job
+	visibleRows := m.height - 7 // title + header + separator + help + padding
+	visibleRows = max(visibleRows, 1)
+	startIdx := 0
+	if m.fixSelectedIdx >= visibleRows {
+		startIdx = m.fixSelectedIdx - visibleRows + 1
+	}
+
+	for i := startIdx; i < len(m.fixJobs) && i < startIdx+visibleRows; i++ {
+		job := m.fixJobs[i]
+
+		// Status label
+		var statusLabel string
+		var statusStyle lipgloss.Style
+		switch job.Status {
+		case storage.JobStatusQueued:
+			statusLabel = "queued"
+			statusStyle = tuiQueuedStyle
+		case storage.JobStatusRunning:
+			statusLabel = "running"
+			statusStyle = tuiRunningStyle
+		case storage.JobStatusDone:
+			statusLabel = "ready"
+			statusStyle = tuiDoneStyle
+		case storage.JobStatusFailed:
+			statusLabel = "failed"
+			statusStyle = tuiFailedStyle
+		case storage.JobStatusCanceled:
+			statusLabel = "canceled"
+			statusStyle = tuiCanceledStyle
+		case storage.JobStatusApplied:
+			statusLabel = "applied"
+			statusStyle = tuiDoneStyle
+		case storage.JobStatusRebased:
+			statusLabel = "rebased"
+			statusStyle = tuiCanceledStyle
+		}
+
+		parentRef := ""
+		if job.ParentJobID != nil {
+			parentRef = fmt.Sprintf("fixes #%d", *job.ParentJobID)
+		}
+		ref := job.GitRef
+		if len(ref) > refW {
+			ref = ref[:max(1, refW-3)] + "..."
+		}
+		subject := truncateString(job.CommitSubject, subjectW)
+
+		if i == m.fixSelectedIdx {
+			line := fmt.Sprintf("  %-*s #%-4d %-*s %-*s %s",
+				statusW, statusLabel, job.ID, parentW, parentRef, refW, ref, subject)
+			b.WriteString(tuiSelectedStyle.Render(line))
+		} else {
+			styledStatus := statusStyle.Render(fmt.Sprintf("%-*s", statusW, statusLabel))
+			rest := fmt.Sprintf(" #%-4d %-*s %-*s %s",
+				job.ID, parentW, parentRef, refW, ref, subject)
+			b.WriteString("  " + styledStatus + rest)
+		}
+		b.WriteString("\x1b[K\n")
+	}
+
+	// Flash message
+	if m.flashMessage != "" && time.Now().Before(m.flashExpiresAt) && m.flashView == tuiViewTasks {
+		flashStyle := lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "28", Dark: "46"})
+		b.WriteString(flashStyle.Render(m.flashMessage))
+	}
+	b.WriteString("\x1b[K\n")
+
+	// Help
+	b.WriteString(tuiHelpStyle.Render("enter: view | p: patch | A: apply | t: tail | x: cancel | r: refresh | ?: help | T/esc: back"))
+	b.WriteString("\x1b[K\x1b[J")
+
+	return b.String()
+}
+
+func (m tuiModel) renderTasksHelpOverlay(b *strings.Builder) string {
+	help := []string{
+		"",
+		"  Task Status",
+		"    queued     Waiting for a worker to pick up the job",
+		"    running    Agent is working in an isolated worktree",
+		"    ready      Patch captured and ready to apply to your working tree",
+		"    failed     Agent failed (press enter or t to see error details)",
+		"    applied    Patch was applied and committed to your working tree",
+		"    canceled   Job was canceled by user",
+		"",
+		"  Keybindings",
+		"    enter/t    View review output (ready) or error (failed) or tail (running)",
+		"    p          View the patch diff for a ready job",
+		"    A          Apply patch from a ready job to your working tree",
+		"    R          Re-run fix against current HEAD (when patch is stale)",
+		"    F          Trigger a new fix from a review (from queue view)",
+		"    x          Cancel a queued or running job",
+		"    r          Refresh the task list",
+		"    T/esc      Return to the main queue view",
+		"    ?          Toggle this help",
+		"",
+		"  Workflow",
+		"    1. Press F on a failing review to trigger a background fix",
+		"    2. The agent runs in an isolated worktree (your files are untouched)",
+		"    3. When status shows 'ready', press A to apply and commit the patch",
+		"    4. If the patch is stale (code changed since), press R to re-run",
+		"",
+	}
+	for _, line := range help {
+		b.WriteString(line)
+		b.WriteString("\x1b[K\n")
+	}
+	b.WriteString(tuiHelpStyle.Render("?: close help"))
+	b.WriteString("\x1b[K\x1b[J")
+	return b.String()
+}
+
+// fetchPatch fetches the patch for a fix job from the daemon.
+func (m tuiModel) fetchPatch(jobID int64) tea.Cmd {
+	return func() tea.Msg {
+		url := m.serverAddr + fmt.Sprintf("/api/job/patch?job_id=%d", jobID)
+		resp, err := m.client.Get(url)
+		if err != nil {
+			return tuiPatchMsg{jobID: jobID, err: err}
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return tuiPatchMsg{jobID: jobID, err: fmt.Errorf("no patch available (HTTP %d)", resp.StatusCode)}
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return tuiPatchMsg{jobID: jobID, err: err}
+		}
+		return tuiPatchMsg{jobID: jobID, patch: string(data)}
+	}
+}
+
+func (m tuiModel) renderPatchView() string {
+	var b strings.Builder
+
+	b.WriteString(tuiTitleStyle.Render(fmt.Sprintf("patch for fix job #%d", m.patchJobID)))
+	b.WriteString("\x1b[K\n")
+
+	if m.patchText == "" {
+		b.WriteString("\n  No patch available.\n")
+	} else {
+		lines := strings.Split(m.patchText, "\n")
+		visibleRows := max(m.height-4, 1)
+		maxScroll := max(len(lines)-visibleRows, 0)
+		start := max(min(m.patchScroll, maxScroll), 0)
+		end := min(start+visibleRows, len(lines))
+
+		addStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("34"))   // green
+		delStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("160"))  // red
+		hdrStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("33"))   // blue
+		metaStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245")) // gray
+
+		for _, line := range lines[start:end] {
+			display := line
+			switch {
+			case strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++"):
+				display = addStyle.Render(line)
+			case strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+				display = delStyle.Render(line)
+			case strings.HasPrefix(line, "@@"):
+				display = hdrStyle.Render(line)
+			case strings.HasPrefix(line, "diff ") || strings.HasPrefix(line, "index ") ||
+				strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++"):
+				display = metaStyle.Render(line)
+			}
+			b.WriteString("  " + display)
+			b.WriteString("\x1b[K\n")
+		}
+
+		if len(lines) > visibleRows {
+			pct := 0
+			if maxScroll > 0 {
+				pct = start * 100 / maxScroll
+			}
+			b.WriteString(tuiHelpStyle.Render(fmt.Sprintf("  [%d%%]", pct)))
+			b.WriteString("\x1b[K\n")
+		}
+	}
+
+	b.WriteString(tuiHelpStyle.Render("j/k/up/down: scroll | esc: back to tasks"))
+	b.WriteString("\x1b[K\x1b[J")
+	return b.String()
+}
+
+// renderFixPromptView renders the fix prompt confirmation modal.
+func (m tuiModel) renderFixPromptView() string {
+	var b strings.Builder
+
+	b.WriteString(tuiTitleStyle.Render(fmt.Sprintf("Fix Review #%d", m.fixPromptJobID)))
+	b.WriteString("\x1b[K\n\n")
+
+	b.WriteString("  A background fix agent will address the review findings.\n")
+	b.WriteString("  Optionally enter custom instructions (or press enter for default):\n\n")
+
+	// Show prompt input
+	promptDisplay := m.fixPromptText
+	if promptDisplay == "" {
+		promptDisplay = "(default: fix all findings from the review)"
+	}
+	fmt.Fprintf(&b, "  > %s_\n", promptDisplay)
+	b.WriteString("\n")
+
+	b.WriteString(tuiHelpStyle.Render("enter: start fix | esc: cancel"))
+	b.WriteString("\x1b[K\x1b[J")
+
+	return b.String()
+}
+
+// fetchJobByID fetches a single job by ID from the daemon API.
+func (m tuiModel) fetchJobByID(jobID int64) (*storage.ReviewJob, error) {
+	var result struct {
+		Jobs []storage.ReviewJob `json:"jobs"`
+	}
+	if err := m.getJSON(fmt.Sprintf("/api/jobs?id=%d", jobID), &result); err != nil {
+		return nil, err
+	}
+	for i := range result.Jobs {
+		if result.Jobs[i].ID == jobID {
+			return &result.Jobs[i], nil
+		}
+	}
+	return nil, fmt.Errorf("job %d not found", jobID)
+}
+
+// hasActiveFixJobs returns true if any fix jobs are queued or running.
+func (m tuiModel) hasActiveFixJobs() bool {
+	for _, j := range m.fixJobs {
+		if j.Status == storage.JobStatusQueued || j.Status == storage.JobStatusRunning {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchFixJobs fetches fix jobs from the daemon.
+func (m tuiModel) fetchFixJobs() tea.Cmd {
+	return func() tea.Msg {
+		var result struct {
+			Jobs []storage.ReviewJob `json:"jobs"`
+		}
+		err := m.getJSON("/api/jobs?job_type=fix&limit=200", &result)
+		if err != nil {
+			return tuiFixJobsMsg{err: err}
+		}
+		return tuiFixJobsMsg{jobs: result.Jobs}
+	}
+}
+
+// triggerFix triggers a background fix job for a parent review.
+func (m tuiModel) triggerFix(parentJobID int64, prompt string) tea.Cmd {
+	return func() tea.Msg {
+		req := map[string]any{
+			"parent_job_id": parentJobID,
+		}
+		if prompt != "" {
+			req["prompt"] = prompt
+		}
+		var job storage.ReviewJob
+		err := m.postJSON("/api/job/fix", req, &job)
+		if err != nil {
+			return tuiFixTriggerResultMsg{err: err}
+		}
+		return tuiFixTriggerResultMsg{job: &job}
+	}
+}
+
+// applyFixPatch fetches and applies the patch for a completed fix job.
+func (m tuiModel) applyFixPatch(jobID int64) tea.Cmd {
+	return func() tea.Msg {
+		// Fetch the patch
+		url := m.serverAddr + fmt.Sprintf("/api/job/patch?job_id=%d", jobID)
+		resp, err := m.client.Get(url)
+		if err != nil {
+			return tuiApplyPatchResultMsg{jobID: jobID, err: err}
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return tuiApplyPatchResultMsg{jobID: jobID, err: fmt.Errorf("no patch available")}
+		}
+
+		patchData, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return tuiApplyPatchResultMsg{jobID: jobID, err: err}
+		}
+		patch := string(patchData)
+		if patch == "" {
+			return tuiApplyPatchResultMsg{jobID: jobID, err: fmt.Errorf("empty patch")}
+		}
+
+		// Fetch the job to find repo path
+		jobDetail, jErr := m.fetchJobByID(jobID)
+		if jErr != nil {
+			return tuiApplyPatchResultMsg{jobID: jobID, err: jErr}
+		}
+
+		// Check for uncommitted changes in files the patch touches
+		patchedFiles, pfErr := patchFiles(patch)
+		if pfErr != nil {
+			return tuiApplyPatchResultMsg{jobID: jobID, err: pfErr}
+		}
+		dirty, dirtyErr := dirtyPatchFiles(jobDetail.RepoPath, patchedFiles)
+		if dirtyErr != nil {
+			return tuiApplyPatchResultMsg{jobID: jobID,
+				err: fmt.Errorf("checking dirty files: %w", dirtyErr)}
+		}
+		if len(dirty) > 0 {
+			return tuiApplyPatchResultMsg{jobID: jobID,
+				err: fmt.Errorf("uncommitted changes in patch files: %s — stash or commit first", strings.Join(dirty, ", "))}
+		}
+
+		// Dry-run check — only trigger rebase on actual merge conflicts
+		if err := worktree.CheckPatch(jobDetail.RepoPath, patch); err != nil {
+			var conflictErr *worktree.PatchConflictError
+			if errors.As(err, &conflictErr) {
+				return tuiApplyPatchResultMsg{jobID: jobID, rebase: true, err: err}
+			}
+			return tuiApplyPatchResultMsg{jobID: jobID, err: err}
+		}
+
+		// Apply the patch
+		if err := worktree.ApplyPatch(jobDetail.RepoPath, patch); err != nil {
+			return tuiApplyPatchResultMsg{jobID: jobID, err: err}
+		}
+
+		var parentJobID int64
+		if jobDetail.ParentJobID != nil {
+			parentJobID = *jobDetail.ParentJobID
+		}
+
+		// Stage and commit
+		commitMsg := fmt.Sprintf("fix: apply roborev fix job #%d", jobID)
+		if parentJobID > 0 {
+			ref := jobDetail.GitRef
+			if len(ref) > 7 {
+				ref = ref[:7]
+			}
+			commitMsg = fmt.Sprintf("fix: apply roborev fix for %s (job #%d)", ref, jobID)
+		}
+		if err := commitPatch(jobDetail.RepoPath, patch, commitMsg); err != nil {
+			return tuiApplyPatchResultMsg{jobID: jobID, parentJobID: parentJobID, success: true,
+				err: fmt.Errorf("patch applied but commit failed: %w", err)}
+		}
+
+		// Mark the fix job as applied on the server
+		if err := m.postJSON("/api/job/applied", map[string]any{"job_id": jobID}, nil); err != nil {
+			return tuiApplyPatchResultMsg{jobID: jobID, parentJobID: parentJobID, success: true,
+				err: fmt.Errorf("patch applied and committed but failed to mark applied: %w", err)}
+		}
+
+		return tuiApplyPatchResultMsg{jobID: jobID, parentJobID: parentJobID, success: true}
+	}
+}
+
+// commitPatch stages only the files touched by patch and commits them.
+func commitPatch(repoPath, patch, message string) error {
+	files, err := patchFiles(patch)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no files found in patch")
+	}
+	args := append([]string{"-C", repoPath, "add", "--"}, files...)
+	addCmd := exec.Command("git", args...)
+	addCmd.Env = append(os.Environ(), "GIT_LITERAL_PATHSPECS=1")
+	if out, err := addCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git add: %w: %s", err, out)
+	}
+	commitArgs := append(
+		[]string{"-C", repoPath, "commit", "--only", "-m", message, "--"},
+		files...,
+	)
+	commitCmd := exec.Command("git", commitArgs...)
+	commitCmd.Env = append(os.Environ(), "GIT_LITERAL_PATHSPECS=1")
+	if out, err := commitCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git commit: %w: %s", err, out)
+	}
+	return nil
+}
+
+// dirtyPatchFiles returns the subset of files that have uncommitted changes.
+func dirtyPatchFiles(repoPath string, files []string) ([]string, error) {
+	// git diff --name-only shows unstaged changes; --cached shows staged
+	cmd := exec.Command("git", "-C", repoPath, "diff", "--name-only", "HEAD", "--")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git diff: %w", err)
+	}
+	dirty := map[string]bool{}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		if line != "" {
+			dirty[line] = true
+		}
+	}
+	var overlap []string
+	for _, f := range files {
+		if dirty[f] {
+			overlap = append(overlap, f)
+		}
+	}
+	return overlap, nil
+}
+
+// patchFiles extracts the list of file paths touched by a unified diff.
+func patchFiles(patch string) ([]string, error) {
+	fileDiffs, err := godiff.ParseMultiFileDiff([]byte(patch))
+	if err != nil {
+		return nil, fmt.Errorf("parse patch: %w", err)
+	}
+	seen := map[string]bool{}
+	addFile := func(name, prefix string) {
+		name = strings.TrimPrefix(name, prefix)
+		if name != "" && name != "/dev/null" {
+			seen[name] = true
+		}
+	}
+	for _, fd := range fileDiffs {
+		addFile(fd.OrigName, "a/") // old path (stages deletion for renames)
+		addFile(fd.NewName, "b/")  // new path (stages addition for renames)
+	}
+	files := make([]string, 0, len(seen))
+	for f := range seen {
+		files = append(files, f)
+	}
+	return files, nil
+}
+
+// triggerRebase triggers a new fix job that re-applies a stale patch to the current HEAD.
+// The server looks up the stale patch from the DB, avoiding large client-to-server transfers.
+func (m tuiModel) triggerRebase(staleJobID int64) tea.Cmd {
+	return func() tea.Msg {
+		// Find the parent job ID (the original review this fix was for)
+		staleJob, fetchErr := m.fetchJobByID(staleJobID)
+		if fetchErr != nil {
+			return tuiFixTriggerResultMsg{err: fmt.Errorf("stale job %d not found: %w", staleJobID, fetchErr)}
+		}
+
+		// Use the original parent job ID if this was already a fix job
+		parentJobID := staleJobID
+		if staleJob.ParentJobID != nil {
+			parentJobID = *staleJob.ParentJobID
+		}
+
+		// Let the server build the rebase prompt from the stale job's patch
+		req := map[string]any{
+			"parent_job_id": parentJobID,
+			"stale_job_id":  staleJobID,
+		}
+		var newJob storage.ReviewJob
+		if err := m.postJSON("/api/job/fix", req, &newJob); err != nil {
+			return tuiFixTriggerResultMsg{err: fmt.Errorf("trigger rebase: %w", err)}
+		}
+		// Mark the stale job as rebased now that the new job exists.
+		// Skip if already rebased (e.g. retry via R on a rebased job).
+		var warning string
+		if staleJob.Status != storage.JobStatusRebased {
+			if err := m.postJSON(
+				"/api/job/rebased",
+				map[string]any{"job_id": staleJobID},
+				nil,
+			); err != nil {
+				warning = fmt.Sprintf(
+					"rebase job #%d enqueued but failed to mark #%d as rebased: %v",
+					newJob.ID, staleJobID, err,
+				)
+			}
+		}
+		return tuiFixTriggerResultMsg{job: &newJob, warning: warning}
+	}
+}
+
+// truncateString is defined in fix.go

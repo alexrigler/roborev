@@ -1,18 +1,12 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +17,7 @@ import (
 	"github.com/roborev-dev/roborev/internal/git"
 	"github.com/roborev-dev/roborev/internal/prompt"
 	"github.com/roborev-dev/roborev/internal/storage"
+	"github.com/roborev-dev/roborev/internal/worktree"
 	"github.com/spf13/cobra"
 )
 
@@ -513,13 +508,14 @@ func runRefine(ctx RunContext, opts refineOptions) error {
 		branchBefore := git.GetCurrentBranch(repoPath)
 
 		// Create temp worktree to isolate agent from user's working tree
-		worktreePath, cleanupWorktree, err := createTempWorktree(repoPath)
+		wt, err := worktree.Create(repoPath)
 		if err != nil {
 			return fmt.Errorf("create worktree: %w", err)
 		}
+		worktreePath := wt.Dir
 		// NOTE: not using defer here because we're inside a loop;
 		// defer wouldn't run until runRefine returns, leaking worktrees.
-		// Instead, cleanupWorktree() is called explicitly before every exit point.
+		// Instead, wt.Close() is called explicitly before every exit point.
 
 		// Determine output writer
 		var agentOutput io.Writer
@@ -554,23 +550,23 @@ func runRefine(ctx RunContext, opts refineOptions) error {
 
 		// Safety checks on main repo (before applying any changes)
 		if wasCleanBefore && !git.IsWorkingTreeClean(repoPath) {
-			cleanupWorktree()
+			wt.Close()
 			return fmt.Errorf("working tree changed during refine - aborting to prevent data loss")
 		}
 		headAfterAgent, resolveErr := git.ResolveSHA(repoPath, "HEAD")
 		if resolveErr != nil {
-			cleanupWorktree()
+			wt.Close()
 			return fmt.Errorf("cannot determine HEAD after agent run: %w", resolveErr)
 		}
 		branchAfterAgent := git.GetCurrentBranch(repoPath)
 		if headAfterAgent != headBefore || branchAfterAgent != branchBefore {
-			cleanupWorktree()
+			wt.Close()
 			return fmt.Errorf("HEAD changed during refine (was %s on %s, now %s on %s) - aborting to prevent applying patch to wrong commit",
 				shortSHA(headBefore), branchBefore, shortSHA(headAfterAgent), branchAfterAgent)
 		}
 
 		if agentErr != nil {
-			cleanupWorktree()
+			wt.Close()
 			fmt.Printf("Agent error: %v\n", agentErr)
 			fmt.Println("Will retry in next iteration")
 			continue
@@ -578,7 +574,7 @@ func runRefine(ctx RunContext, opts refineOptions) error {
 
 		// Check if agent made changes in worktree
 		if git.IsWorkingTreeClean(worktreePath) {
-			cleanupWorktree()
+			wt.Close()
 			fmt.Println("Agent made no changes - skipping this review")
 			if err := client.AddComment(currentFailedReview.JobID, "roborev-refine", "Agent could not determine how to address findings"); err != nil {
 				fmt.Printf("Warning: failed to add comment to job %d: %v\n", currentFailedReview.JobID, err)
@@ -588,12 +584,17 @@ func runRefine(ctx RunContext, opts refineOptions) error {
 			continue
 		}
 
-		// Apply worktree changes to main repo and commit
-		if err := applyWorktreeChanges(repoPath, worktreePath); err != nil {
-			cleanupWorktree()
-			return fmt.Errorf("apply worktree changes: %w", err)
+		// Capture patch from worktree and apply to main repo
+		patch, err := wt.CapturePatch()
+		if err != nil {
+			wt.Close()
+			return fmt.Errorf("capture worktree patch: %w", err)
 		}
-		cleanupWorktree()
+		if err := worktree.ApplyPatch(repoPath, patch); err != nil {
+			wt.Close()
+			return fmt.Errorf("apply worktree patch: %w", err)
+		}
+		wt.Close()
 
 		commitMsg := fmt.Sprintf("Address review findings (job %d)\n\n%s", currentFailedReview.JobID, summarizeAgentOutput(output))
 		newCommit, err := commitWithHookRetry(repoPath, commitMsg, addressAgent, opts.quiet)
@@ -1024,167 +1025,7 @@ func summarizeAgentOutput(output string) string {
 	return strings.Join(summary, "\n")
 }
 
-// createTempWorktree creates a temporary git worktree for isolated agent work
-func createTempWorktree(repoPath string) (string, func(), error) {
-	worktreeDir, err := os.MkdirTemp("", "roborev-refine-")
-	if err != nil {
-		return "", nil, err
-	}
-
-	// Create the worktree (without --recurse-submodules for compatibility with older git).
-	// Suppress hooks via core.hooksPath=<null> — user hooks shouldn't run in internal worktrees.
-	cmd := exec.Command("git", "-C", repoPath, "-c", "core.hooksPath="+os.DevNull, "worktree", "add", "--detach", worktreeDir, "HEAD")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.RemoveAll(worktreeDir)
-		return "", nil, fmt.Errorf("git worktree add: %w: %s", err, out)
-	}
-
-	// Initialize and update submodules in the worktree
-	initArgs := []string{"-C", worktreeDir}
-	if submoduleRequiresFileProtocol(worktreeDir) {
-		initArgs = append(initArgs, "-c", "protocol.file.allow=always")
-	}
-	initArgs = append(initArgs, "submodule", "update", "--init")
-	cmd = exec.Command("git", initArgs...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", worktreeDir).Run()
-		_ = os.RemoveAll(worktreeDir)
-		return "", nil, fmt.Errorf("git submodule update: %w: %s", err, out)
-	}
-
-	updateArgs := []string{"-C", worktreeDir}
-	if submoduleRequiresFileProtocol(worktreeDir) {
-		updateArgs = append(updateArgs, "-c", "protocol.file.allow=always")
-	}
-	updateArgs = append(updateArgs, "submodule", "update", "--init", "--recursive")
-	cmd = exec.Command("git", updateArgs...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", worktreeDir).Run()
-		_ = os.RemoveAll(worktreeDir)
-		return "", nil, fmt.Errorf("git submodule update: %w: %s", err, out)
-	}
-
-	lfsCmd := exec.Command("git", "-C", worktreeDir, "lfs", "env")
-	if err := lfsCmd.Run(); err == nil {
-		cmd = exec.Command("git", "-C", worktreeDir, "lfs", "pull")
-		_ = cmd.Run()
-	}
-
-	cleanup := func() {
-		_ = exec.Command("git", "-C", repoPath, "worktree", "remove", "--force", worktreeDir).Run()
-		_ = os.RemoveAll(worktreeDir)
-	}
-
-	return worktreeDir, cleanup, nil
-}
-
-func submoduleRequiresFileProtocol(repoPath string) bool {
-	gitmodulesPaths := findGitmodulesPaths(repoPath)
-	if len(gitmodulesPaths) == 0 {
-		return false
-	}
-	for _, gitmodulesPath := range gitmodulesPaths {
-		file, err := os.Open(gitmodulesPath)
-		if err != nil {
-			continue
-		}
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-				continue
-			}
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) != 2 {
-				continue
-			}
-			if !strings.EqualFold(strings.TrimSpace(parts[0]), "url") {
-				continue
-			}
-			url := strings.TrimSpace(parts[1])
-			if unquoted, err := strconv.Unquote(url); err == nil {
-				url = unquoted
-			}
-			if isFileProtocolURL(url) {
-				file.Close()
-				return true
-			}
-		}
-		file.Close()
-	}
-	return false
-}
-
-func findGitmodulesPaths(repoPath string) []string {
-	var paths []string
-	err := filepath.WalkDir(repoPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() && d.Name() == ".git" {
-			return filepath.SkipDir
-		}
-		if d.Name() == ".gitmodules" {
-			paths = append(paths, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil
-	}
-	return paths
-}
-
-func isFileProtocolURL(url string) bool {
-	lower := strings.ToLower(url)
-	if strings.HasPrefix(lower, "file:") {
-		return true
-	}
-	if strings.HasPrefix(url, "/") || strings.HasPrefix(url, "./") || strings.HasPrefix(url, "../") {
-		return true
-	}
-	if len(url) >= 2 && isAlpha(url[0]) && url[1] == ':' {
-		return true
-	}
-	if strings.HasPrefix(url, `\\`) {
-		return true
-	}
-	return false
-}
-
-func isAlpha(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
-}
-
-// applyWorktreeChanges applies changes from worktree to main repo via patch
-func applyWorktreeChanges(repoPath, worktreePath string) error {
-	// Stage all changes in worktree
-	cmd := exec.Command("git", "-C", worktreePath, "add", "-A")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git add in worktree: %w: %s", err, out)
-	}
-
-	// Get diff as patch
-	diffCmd := exec.Command("git", "-C", worktreePath, "diff", "--cached", "--binary")
-	diff, err := diffCmd.Output()
-	if err != nil {
-		return fmt.Errorf("git diff in worktree: %w", err)
-	}
-	if len(diff) == 0 {
-		return nil // No changes
-	}
-
-	// Apply patch to main repo
-	applyCmd := exec.Command("git", "-C", repoPath, "apply", "--binary", "-")
-	applyCmd.Stdin = bytes.NewReader(diff)
-	var stderr bytes.Buffer
-	applyCmd.Stderr = &stderr
-	if err := applyCmd.Run(); err != nil {
-		return fmt.Errorf("git apply: %w: %s", err, stderr.String())
-	}
-
-	return nil
-}
+// Worktree creation and patch operations are in internal/worktree package.
 
 // commitWithHookRetry attempts git.CreateCommit and, on failure,
 // runs the agent to fix whatever the hook complained about. Only
