@@ -10,7 +10,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/roborev-dev/roborev/internal/agent"
 	"github.com/roborev-dev/roborev/internal/config"
 	gitpkg "github.com/roborev-dev/roborev/internal/git"
+	reviewpkg "github.com/roborev-dev/roborev/internal/review"
 	"github.com/roborev-dev/roborev/internal/storage"
 )
 
@@ -287,28 +287,10 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 		}
 	}
 
-	// Validate, canonicalize, and dedupe review types.
-	// Empty string is rejected here (likely a config typo); use "default" explicitly.
-	validSpecialTypes := map[string]bool{"security": true, "design": true}
-	seen := make(map[string]bool, len(reviewTypes))
-	canonical := make([]string, 0, len(reviewTypes))
-	for _, rt := range reviewTypes {
-		if rt == "" {
-			return fmt.Errorf("invalid review_type %q (valid: default, security, design)", rt)
-		}
-		if !config.IsDefaultReviewType(rt) && !validSpecialTypes[rt] {
-			return fmt.Errorf("invalid review_type %q (valid: default, security, design)", rt)
-		}
-		// Normalize aliases to canonical "default"
-		if config.IsDefaultReviewType(rt) {
-			rt = "default"
-		}
-		if !seen[rt] {
-			seen[rt] = true
-			canonical = append(canonical, rt)
-		}
+	reviewTypes, err = config.ValidateReviewTypes(reviewTypes)
+	if err != nil {
+		return err
 	}
-	reviewTypes = canonical
 
 	totalJobs := len(reviewTypes) * len(agents)
 
@@ -317,10 +299,7 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 	if canceledIDs, err := p.db.CancelSupersededBatches(ghRepo, pr.Number, pr.HeadRefOid); err != nil {
 		log.Printf("CI poller: error canceling superseded batches for %s#%d: %v", ghRepo, pr.Number, err)
 	} else if len(canceledIDs) > 0 {
-		headShort := pr.HeadRefOid
-		if len(headShort) > 8 {
-			headShort = headShort[:8]
-		}
+		headShort := gitpkg.ShortSHA(pr.HeadRefOid)
 		log.Printf("CI poller: canceled %d superseded jobs for %s#%d (new HEAD=%s)",
 			len(canceledIDs), ghRepo, pr.Number, headShort)
 		// Also kill running worker processes so they stop consuming compute.
@@ -455,10 +434,7 @@ func (p *CIPoller) processPR(ctx context.Context, ghRepo string, pr ghPR, cfg *c
 		}
 	}
 
-	headShort := pr.HeadRefOid
-	if len(headShort) > 8 {
-		headShort = headShort[:8]
-	}
+	headShort := gitpkg.ShortSHA(pr.HeadRefOid)
 	log.Printf("CI poller: created batch %d for %s#%d (HEAD=%s, %d jobs)",
 		batch.ID, ghRepo, pr.Number, headShort, totalJobs)
 
@@ -809,7 +785,7 @@ func (p *CIPoller) postBatchResults(batch *storage.CIPRBatch) {
 	var comment string
 	successCount := 0
 	for _, r := range reviews {
-		if r.Status == "done" {
+		if r.Status == reviewpkg.ResultDone {
 			successCount++
 		}
 	}
@@ -829,14 +805,14 @@ func (p *CIPoller) postBatchResults(batch *storage.CIPRBatch) {
 		comment = formatPRComment(review, verdict)
 	} else if successCount == 0 {
 		// All jobs failed — post raw error comment
-		comment = formatAllFailedComment(reviews, batch.HeadSHA)
+		comment = reviewpkg.FormatAllFailedComment(toReviewResults(reviews), batch.HeadSHA)
 	} else {
 		// Multiple jobs — try synthesis
 		cfg := p.cfgGetter.Config()
 		synthesized, err := p.callSynthesize(batch, reviews, cfg)
 		if err != nil {
 			log.Printf("CI poller: synthesis failed for batch %d: %v (falling back to raw)", batch.ID, err)
-			comment = formatRawBatchComment(reviews, batch.HeadSHA)
+			comment = reviewpkg.FormatRawBatchComment(toReviewResults(reviews), batch.HeadSHA)
 		} else {
 			comment = synthesized
 		}
@@ -858,7 +834,7 @@ func (p *CIPoller) postBatchResults(batch *storage.CIPRBatch) {
 	//   all failures are quota skips → success (with note)
 	//   mixed real failures          → failure
 	//   all failed (real)            → error
-	quotaSkips := countQuotaFailures(reviews)
+	quotaSkips := reviewpkg.CountQuotaFailures(toReviewResults(reviews))
 	realFailures := batch.FailedJobs - quotaSkips
 	statusState := "success"
 	statusDesc := "Review complete"
@@ -994,7 +970,7 @@ func (p *CIPoller) synthesizeBatchResults(batch *storage.CIPRBatch, reviews []st
 	}
 
 	minSeverity := resolveMinSeverity(cfg.CI.MinSeverity, repoPath, batch.GithubRepo)
-	prompt := buildSynthesisPrompt(reviews, minSeverity)
+	prompt := reviewpkg.BuildSynthesisPrompt(toReviewResults(reviews), minSeverity)
 
 	// Run synthesis from the repo's checkout directory so agents that
 	// require a git working tree (e.g. codex) don't fail.
@@ -1006,7 +982,7 @@ func (p *CIPoller) synthesizeBatchResults(batch *storage.CIPRBatch, reviews []st
 		return "", fmt.Errorf("synthesis review: %w", err)
 	}
 
-	return formatSynthesizedComment(output, reviews, batch.HeadSHA), nil
+	return reviewpkg.FormatSynthesizedComment(output, toReviewResults(reviews), batch.HeadSHA), nil
 }
 
 func (p *CIPoller) callListOpenPRs(ctx context.Context, ghRepo string) ([]ghPR, error) {
@@ -1102,221 +1078,29 @@ func (p *CIPoller) setCommitStatus(ghRepo, sha, state, description string) error
 	return nil
 }
 
-// severityAbove maps a minimum severity to the instruction describing which levels to include.
-var severityAbove = map[string]string{
-	"critical": "Only include Critical findings.",
-	"high":     "Only include High and Critical findings.",
-	"medium":   "Only include Medium, High, and Critical findings.",
+// toReviewResults converts storage batch results to the
+// review package's ReviewResult type.
+func toReviewResults(
+	brs []storage.BatchReviewResult,
+) []reviewpkg.ReviewResult {
+	rrs := make([]reviewpkg.ReviewResult, len(brs))
+	for i, br := range brs {
+		rrs[i] = toReviewResult(br)
+	}
+	return rrs
 }
 
-// buildSynthesisPrompt creates the prompt for the synthesis agent.
-// When minSeverity is non-empty (and not "low"), a filtering instruction is appended.
-func buildSynthesisPrompt(reviews []storage.BatchReviewResult, minSeverity string) string {
-	var b strings.Builder
-	b.WriteString(`You are combining multiple code review outputs into a single GitHub PR comment.
-Rules:
-- Deduplicate findings reported by multiple agents
-- Organize by severity (Critical > High > Medium > Low)
-- Preserve file/line references
-- If all agents agree code is clean, say so concisely
-- Start with a one-line summary verdict
-- Use markdown formatting
-- No preamble about yourself
-`)
-
-	if instruction, ok := severityAbove[minSeverity]; ok {
-		b.WriteString("- Omit findings below " + minSeverity + " severity. " + instruction + "\n")
+// toReviewResult converts a single storage batch result.
+func toReviewResult(
+	br storage.BatchReviewResult,
+) reviewpkg.ReviewResult {
+	return reviewpkg.ReviewResult{
+		Agent:      br.Agent,
+		ReviewType: br.ReviewType,
+		Output:     br.Output,
+		Status:     br.Status,
+		Error:      br.Error,
 	}
-
-	b.WriteString("\n")
-
-	// Truncate per-review output to avoid blowing the synthesis agent's context window.
-	const maxPerReview = 15000
-
-	for i, r := range reviews {
-		fmt.Fprintf(&b, "---\n### Review %d: Agent=%s, Type=%s", i+1, r.Agent, r.ReviewType)
-		if isQuotaFailure(r) {
-			b.WriteString(" [SKIPPED]")
-		} else if r.Status == "failed" {
-			b.WriteString(" [FAILED]")
-		}
-		b.WriteString("\n")
-		if isQuotaFailure(r) {
-			b.WriteString("(review skipped — agent quota exhausted)")
-		} else if r.Output != "" {
-			output := r.Output
-			if len(output) > maxPerReview {
-				output = output[:maxPerReview] + "\n\n...(truncated)"
-			}
-			b.WriteString(output)
-		} else if r.Status == "failed" {
-			b.WriteString("(no output — review failed)")
-		}
-		b.WriteString("\n\n")
-	}
-
-	return b.String()
-}
-
-// formatSynthesizedComment wraps synthesized output with header and metadata.
-func formatSynthesizedComment(output string, reviews []storage.BatchReviewResult, headSHA string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## roborev: Combined Review (`%s`)\n\n", shortSHA(headSHA))
-	b.WriteString(output)
-
-	// Build metadata
-	agentSet := make(map[string]struct{})
-	typeSet := make(map[string]struct{})
-	for _, r := range reviews {
-		if r.Agent != "" {
-			agentSet[r.Agent] = struct{}{}
-		}
-		if r.ReviewType != "" {
-			typeSet[r.ReviewType] = struct{}{}
-		}
-	}
-	var agents, types []string
-	for a := range agentSet {
-		agents = append(agents, a)
-	}
-	for t := range typeSet {
-		types = append(types, t)
-	}
-
-	fmt.Fprintf(&b, "\n\n---\n*Synthesized from %d reviews (agents: %s | types: %s)*\n",
-		len(reviews), strings.Join(agents, ", "), strings.Join(types, ", "))
-
-	if note := skippedAgentNote(reviews); note != "" {
-		b.WriteString(note)
-	}
-
-	return b.String()
-}
-
-// formatRawBatchComment formats all review outputs as separate details blocks.
-// Used as a fallback when synthesis fails.
-func formatRawBatchComment(reviews []storage.BatchReviewResult, headSHA string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "## roborev: Combined Review (`%s`)\n\n", shortSHA(headSHA))
-	b.WriteString("> Synthesis unavailable. Showing raw review outputs.\n\n")
-
-	for _, r := range reviews {
-		status := r.Status
-		if isQuotaFailure(r) {
-			status = "skipped (quota)"
-		}
-		summary := fmt.Sprintf("Agent: %s | Type: %s | Status: %s", r.Agent, r.ReviewType, status)
-		fmt.Fprintf(&b, "<details>\n<summary>%s</summary>\n\n", summary)
-		if isQuotaFailure(r) {
-			b.WriteString("Review skipped — agent quota exhausted.\n")
-		} else if r.Status == "failed" {
-			b.WriteString("**Error:** Review failed. Check daemon logs for details.\n")
-		} else if r.Output != "" {
-			output := r.Output
-			const maxLen = 15000
-			if len(output) > maxLen {
-				output = output[:maxLen] + "\n\n...(truncated)"
-			}
-			b.WriteString(output)
-		} else {
-			b.WriteString("(no output)")
-		}
-		b.WriteString("\n\n</details>\n\n")
-	}
-
-	if note := skippedAgentNote(reviews); note != "" {
-		b.WriteString(note)
-	}
-
-	return b.String()
-}
-
-// formatAllFailedComment formats a comment when every job in a batch failed.
-func formatAllFailedComment(reviews []storage.BatchReviewResult, headSHA string) string {
-	quotaSkips := countQuotaFailures(reviews)
-	allQuota := len(reviews) > 0 && quotaSkips == len(reviews)
-
-	var b strings.Builder
-	if allQuota {
-		fmt.Fprintf(&b, "## roborev: Review Skipped (`%s`)\n\n", shortSHA(headSHA))
-		b.WriteString("All review agents were skipped due to quota exhaustion.\n\n")
-	} else {
-		fmt.Fprintf(&b, "## roborev: Review Failed (`%s`)\n\n", shortSHA(headSHA))
-		b.WriteString("All review jobs in this batch failed.\n\n")
-	}
-
-	for _, r := range reviews {
-		if isQuotaFailure(r) {
-			fmt.Fprintf(&b, "- **%s** (%s): skipped (quota)\n", r.Agent, r.ReviewType)
-		} else {
-			fmt.Fprintf(&b, "- **%s** (%s): failed\n", r.Agent, r.ReviewType)
-		}
-	}
-
-	if !allQuota {
-		b.WriteString("\nCheck daemon logs for error details.")
-	}
-
-	if note := skippedAgentNote(reviews); note != "" {
-		b.WriteString(note)
-	}
-
-	return b.String()
-}
-
-// isQuotaFailure returns true if a batch review's error indicates a quota
-// skip rather than a real failure. Matches the prefix set by worker.go.
-func isQuotaFailure(r storage.BatchReviewResult) bool {
-	return r.Status == "failed" && strings.HasPrefix(r.Error, quotaErrorPrefix)
-}
-
-// countQuotaFailures returns the number of reviews that failed due to
-// agent quota exhaustion rather than a real error.
-func countQuotaFailures(reviews []storage.BatchReviewResult) int {
-	n := 0
-	for _, r := range reviews {
-		if isQuotaFailure(r) {
-			n++
-		}
-	}
-	return n
-}
-
-// skippedAgentNote returns a markdown note listing agents that were
-// skipped due to quota exhaustion. Returns "" if none were skipped.
-func skippedAgentNote(reviews []storage.BatchReviewResult) string {
-	agents := make(map[string]struct{})
-	for _, r := range reviews {
-		if isQuotaFailure(r) {
-			agents[r.Agent] = struct{}{}
-		}
-	}
-	if len(agents) == 0 {
-		return ""
-	}
-	names := make([]string, 0, len(agents))
-	for a := range agents {
-		names = append(names, a)
-	}
-	sort.Strings(names)
-	if len(names) == 1 {
-		return fmt.Sprintf(
-			"\n*Note: %s review skipped (agent quota exhausted)*\n",
-			names[0],
-		)
-	}
-	return fmt.Sprintf(
-		"\n*Note: %s reviews skipped (agent quota exhausted)*\n",
-		strings.Join(names, ", "),
-	)
-}
-
-// shortSHA returns the first 8 characters of a SHA, or the full string if shorter.
-func shortSHA(sha string) string {
-	if len(sha) > 8 {
-		return sha[:8]
-	}
-	return sha
 }
 
 // formatPRComment formats a review result as a GitHub PR comment in markdown.
@@ -1336,9 +1120,9 @@ func formatPRComment(review *storage.Review, verdict string) string {
 
 	// Include review output (truncated if very long)
 	output := review.Output
-	const maxLen = 60000 // GitHub comment limit is ~65536
-	if len(output) > maxLen {
-		output = output[:maxLen] + "\n\n...(truncated)"
+	if len(output) > reviewpkg.MaxCommentLen {
+		output = output[:reviewpkg.MaxCommentLen] +
+			"\n\n...(truncated)"
 	}
 
 	if verdict != "P" && output != "" {
@@ -1358,9 +1142,10 @@ func formatPRComment(review *storage.Review, verdict string) string {
 // postPRComment posts a comment on a GitHub PR using the gh CLI.
 // Truncates the body to stay within GitHub's ~65536 character limit.
 func (p *CIPoller) postPRComment(ghRepo string, prNumber int, body string) error {
-	const maxCommentLen = 60000 // leave headroom below GitHub's ~65536 limit
-	if len(body) > maxCommentLen {
-		body = body[:maxCommentLen] + "\n\n...(truncated — comment exceeded size limit)"
+	if len(body) > reviewpkg.MaxCommentLen {
+		body = body[:reviewpkg.MaxCommentLen] +
+			"\n\n...(truncated — comment exceeded " +
+			"size limit)"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

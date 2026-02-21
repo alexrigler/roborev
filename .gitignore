@@ -31,3 +31,5 @@ Thumbs.db
 .gomodcache/
 .gopath/
 result
+tmp/
+REPORT.md
