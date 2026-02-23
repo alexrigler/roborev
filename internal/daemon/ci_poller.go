@@ -620,21 +620,39 @@ func isValidGitRepo(path string) bool {
 // Returns (true, nil) on match, (false, nil) on confirmed mismatch
 // (including missing origin), and (false, err) on operational errors
 // (so callers can avoid deleting a valid clone on transient failures).
+//
+// Two-step approach: "git config --get" for locale-independent
+// origin-existence check (exit 1 = missing key), then
+// "git remote get-url" for the resolved URL (handles insteadOf).
 func cloneRemoteMatches(path, ghRepo string) (bool, error) {
-	cmd := exec.Command(
-		"git", "-C", path, "remote", "get-url", "origin",
+	// Step 1: check origin existence (locale-independent exit code).
+	// Use --local to avoid matching global/system config that could
+	// define remote.origin.url outside this repo.
+	cfgCmd := exec.Command(
+		"git", "-C", path,
+		"config", "--local", "--get", "remote.origin.url",
 	)
-	out, err := cmd.Output()
-	if err != nil {
-		// "No such remote 'origin'" is a deterministic invalid
-		// state — treat as confirmed mismatch, not transient error.
+	if err := cfgCmd.Run(); err != nil {
+		// Exit 1 = key missing; exit 128 = not a git repo.
+		// Both mean no local origin configured.
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			stderr := string(exitErr.Stderr)
-			if strings.Contains(stderr, "No such remote") {
+			code := exitErr.ExitCode()
+			if code == 1 || code == 128 {
 				return false, nil
 			}
 		}
+		return false, fmt.Errorf(
+			"check origin for %s: %w", path, err,
+		)
+	}
+
+	// Step 2: get the resolved URL (expands insteadOf rewrites).
+	urlCmd := exec.Command(
+		"git", "-C", path, "remote", "get-url", "origin",
+	)
+	out, err := urlCmd.Output()
+	if err != nil {
 		return false, fmt.Errorf(
 			"get origin URL for %s: %w", path, err,
 		)
